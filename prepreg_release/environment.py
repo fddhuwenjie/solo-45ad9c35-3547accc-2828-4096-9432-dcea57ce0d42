@@ -390,16 +390,12 @@ def evaluate_environment(job, spec, zones, spec_by_id, materials,
     decisions = dec_mt + dec_amb
 
     # ---- 台账：回冻/解冻（roll 走事件链；unit 取出生时刻保守起算）----
-    fridge_by_subject, thaw_last = {}, {}
+    fridge_by_subject, thaw_by_subject = {}, {}
     for rid, ledger in (roll_ledger or {}).items():
         fridge_by_subject[rid] = sorted(
             ts for ts, kind in ledger if kind == "fridge" and ts)
-        thaws = sorted(ts for ts, kind in ledger if kind == "thaw" and ts)
-        if thaws:
-            thaw_last[rid] = thaws[-1]
-    warmup_start = dict(thaw_last)
-    for uid, born in unit_born.items():
-        warmup_start.setdefault(uid, born)
+        thaw_by_subject[rid] = sorted(
+            ts for ts, kind in ledger if kind == "thaw" and ts)
 
     # ---- 铺放引用时刻（含返工替代层）----
     placements = {}
@@ -465,10 +461,11 @@ def evaluate_environment(job, spec, zones, spec_by_id, materials,
               opened_at=o["payload"].get("at"))
 
         limits = _limits_for(config, o["material"], None)
-        # 最低回温时长
+        # 最低回温时长（按本次开封所在的解冻→回冻周期匹配起算点）
         warm_min = limits.get("min_warmup_minutes")
         if warm_min is not None:
-            start = warmup_start.get(subj)
+            start = _warmup_cycle_start(
+                subj, t0, thaw_by_subject, fridge_by_subject, unit_born)
             if start is None:
                 v("ENV_WARMUP_DATA_MISSING",
                   f"材料单元 {subj} 开封（事件 #{o['seq']}）前没有解冻/出生"
@@ -494,13 +491,17 @@ def evaluate_environment(job, spec, zones, spec_by_id, materials,
 
         mt = [r for r in adopted_mt if r["subject"] == subj]
         amb_global = [r for r in adopted_amb if r["zone"] is None]
+        # 已使用该材料单元铺放的层（开袋后任何铺放引用），作为受影响层
+        affected_plies = sorted({
+            pid for pt, pid, _sq in placements.get(subj, [])
+            if pt >= t0 and pid})
         # 开袋前测温
         before = [r for r in mt if r["t"] <= t0]
         if not before:
             v("ENV_TEMP_BEFORE_OPEN_MISSING",
               f"材料单元 {subj} 开封（事件 #{o['seq']}）前没有任何材料温度"
               f"读数，无法核对开袋露点裕量",
-              units=[subj], events=[o["seq"]])
+              units=[subj], plies=affected_plies, events=[o["seq"]])
         # 开袋瞬间露点裕量
         _check_open_dew(v, o, before, amb_global, limits)
         # 开封段采样/越限（全车间通道）
@@ -927,6 +928,29 @@ def _check_surface_dew(v, part, mt_series, amb, limits, material_segments):
 
 def _subject(p):
     return p.get("unit") or p.get("roll")
+
+
+def _warmup_cycle_start(subj, open_t, thaw_by_subject, fridge_by_subject,
+                        unit_born):
+    """开封时刻所在解冻周期的起点。
+
+    按"解冻→回冻"周期匹配：取不晚于开封时刻的最近一次解冻，仅当该解冻
+    之后、开封之前没有回冻（即开封发生在本次在外周期内）时作为回温起算
+    点；上一周期已回冻、本次又解冻但记录缺失时返回 None（回温记录缺段）。
+    已回冻的历史解冻不得反向作用于后续周期。
+    """
+    thaws = thaw_by_subject.get(subj, [])
+    fridges = fridge_by_subject.get(subj, [])
+    prior_thaws = [t for t in thaws if t <= open_t]
+    if not prior_thaws:
+        # 谱系单元无 roll 解冻台账时，以出生时刻作保守起算
+        return unit_born.get(subj)
+    thaw_t = prior_thaws[-1]
+    closed = any(thaw_t < f <= open_t for f in fridges)
+    if closed:
+        # 最近一次解冻已回冻，开封时刻不在任何解冻在外周期内
+        return None
+    return thaw_t
 
 
 def _horizon(events, placements):

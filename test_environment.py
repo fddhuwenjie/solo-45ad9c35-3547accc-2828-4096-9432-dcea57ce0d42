@@ -619,8 +619,8 @@ call("POST", f"/jobs/{jid}/events", {"events": [
 s, r = call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe"})
 vs = [v for v in r.get("violations", [])
       if v["rule"] == "ENV_LIMIT_EXCEEDED"]
-ok = s.startswith("409") and vs and vs[0]["plies"] \
-    and vs[0]["zones"] and vs[0]["details"]["events"]
+ok = bool(s.startswith("409") and vs and vs[0]["plies"]
+          and vs[0]["zones"] and vs[0]["details"]["events"])
 check("环境违规 409 阻止批准且带单元/层/原始事件", ok,
       f"plies={vs[0]['plies'] if vs else None} "
       f"zones={vs[0]['zones'] if vs else None} "
@@ -649,7 +649,98 @@ codes = [c["code"] for c in r.get("conflicts", [])]
 ok = s.startswith("409") and "ENV_SPEC_INVALID" in codes
 check("换版携带非法环境限值 → 409", ok, f"[{s}] {codes}")
 
+# 32. 回温按解冻→回冻周期匹配：06:00 解冻、08:00 合格开袋、08:05 铺放、
+#     08:10 回冻后，11:00 再次解冻不得反向触发 ENV_WARMUP_DATA_MISSING
+jid, _ = new_job(n_plies=1, zone_ids=("Z1",))
+cycle = [
+    {"type": "roll_thawed", "operator": "o", "roll": "R1", "at": iso(T0, 0)},
+    amb(30), amb(60), amb(90),
+    mt(115, 20.0), opened(120), placed("P01", 125),
+    {"type": "roll_refrigerated", "operator": "o", "roll": "R1",
+     "at": iso(T0, 130)},
+    amb(150), amb(180), amb(210), amb(240), amb(270),
+    {"type": "roll_thawed", "operator": "o", "roll": "R1",
+     "at": iso(T0, 300)},
+]
+call("POST", f"/jobs/{jid}/events", {"events": cycle})
+g, r = rules_of(jid)
+warmup_bad = [x for x in g if x in
+              ("ENV_WARMUP_DATA_MISSING", "ENV_WARMUP_SHORT")]
+check("二次解冻不反向触发回温缺段/不足", not warmup_bad and r["release"] == "ok",
+      f"{sorted(g)}")
+# 开封段以 06:00 解冻为回温起点，正好 120min，合格
+_s, st = call("GET", f"/jobs/{jid}/state")
+mi = st["environment"]["material_intervals"][0]
+ok = mi["interval"]["from"] == iso(T0, 120) and mi["closed"] is True
+check("开封段闭合于铺放且回温取自本周期 06:00 解冻", ok,
+      json.dumps(mi["interval"], ensure_ascii=False))
+
+# 32b. 上一周期已回冻、本周期再开封但无本周期解冻 → 应报缺段（不被历史解冻掩盖）
+jid, _ = new_job(n_plies=1, zone_ids=("Z1",))
+cycle_b = [
+    {"type": "roll_thawed", "operator": "o", "roll": "R1", "at": iso(T0, 0)},
+    amb(90), mt(115, 20.0), opened(120), placed("P01", 125),
+    {"type": "roll_refrigerated", "operator": "o", "roll": "R1",
+     "at": iso(T0, 130)},
+    amb(240),
+    # 再次开封（在回冻之后），但没有对应的本周期解冻记录
+    {"type": "package_opened", "operator": "o", "at": iso(T0, 300),
+     "roll": "R1"},
+    amb(330),
+]
+call("POST", f"/jobs/{jid}/events", {"events": cycle_b})
+vs = find(jid, "ENV_WARMUP_DATA_MISSING")
+open_seqs = [e["seq"] for e in _all_events(jid)
+             if e["type"] == "package_opened"]
+ok = bool(vs) and any(open_seqs[-1] in v["details"]["events"] for v in vs)
+check("回冻后再开封无本周期解冻 → ENV_WARMUP_DATA_MISSING", ok,
+      json.dumps(vs, ensure_ascii=False)[:220])
+
+# 33. 缺开袋前测温且已铺放 P1：审批 409，违规项同时列 R1 / P1 / 开封事件号
+jid, _ = new_job(n_plies=1, zone_ids=("Z1",))
+# 事件编排：1 解冻、2 环境读数、3 开封（无材料测温）、4 铺放 P1、5 环境读数
+seq33 = [
+    {"type": "roll_thawed", "operator": "o", "roll": "R1", "at": iso(T0, 0)},
+    amb(90),
+    {"type": "package_opened", "operator": "o", "at": iso(T0, 120),
+     "roll": "R1"},
+    {"type": "ply_placed", "operator": "o", "ply_id": "P01",
+     "roll": "R1", "angle": 0, "face": "up", "geometry": FULL,
+     "placed_at": iso(T0, 125)},
+    amb(150),
+]
+call("POST", f"/jobs/{jid}/events", {"events": seq33})
+s, r = call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe"})
+vs = [v for v in r.get("violations", [])
+      if v["rule"] == "ENV_TEMP_BEFORE_OPEN_MISSING"]
+ok = (s.startswith("409") and bool(vs)
+      and vs[0]["details"]["units"] == ["R1"]
+      and vs[0]["plies"] == ["P01"]
+      and vs[0]["details"]["events"] == [3])
+check("缺开袋前测温+已铺放 → 409 并列 R1/P01/事件3", ok,
+      f"[{s}] units={vs[0]['details']['units'] if vs else None} "
+      f"plies={vs[0]['plies'] if vs else None} "
+      f"events={vs[0]['details']['events'] if vs else None}")
+
+# 33b. 同一缺陷但尚未铺放时：仍 409，plies 为空（不臆造受影响层）
+jid, _ = new_job(n_plies=1, zone_ids=("Z1",))
+call("POST", f"/jobs/{jid}/events", {"events": [
+    {"type": "roll_thawed", "operator": "o", "roll": "R1", "at": iso(T0, 0)},
+    amb(90),
+    {"type": "package_opened", "operator": "o", "at": iso(T0, 120),
+     "roll": "R1"},
+    amb(150),
+]})
+s, r = call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe"})
+vs = [v for v in r.get("violations", [])
+      if v["rule"] == "ENV_TEMP_BEFORE_OPEN_MISSING"]
+ok = (s.startswith("409") and bool(vs)
+      and vs[0]["details"]["units"] == ["R1"]
+      and vs[0]["plies"] == [])
+check("缺测温未铺放 → 409 且 plies 为空", ok,
+      f"plies={vs[0]['plies'] if vs else None}")
+
 # ------------------------------------------------------------------ 汇总
-total, passed = len(results), sum(results)
+total, passed = len(results), sum(1 for x in results if x)
 print(f"\n{passed}/{total} 通过")
 raise SystemExit(0 if passed == total else 1)
