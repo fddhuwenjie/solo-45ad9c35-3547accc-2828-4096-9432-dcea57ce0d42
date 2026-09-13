@@ -13,6 +13,14 @@
   GET  /jobs/{id}/approvals               批准版列表
   GET  /jobs/{id}/approvals/{v}/package   JSON 随件包（取自冻结快照）
   GET  /jobs/{id}/approvals/diff?a=&b=    版本比较（取自冻结快照）
+
+材料谱系（全局共享、跨工单，事件链只允许追加）：
+  POST /materials/units                   登记整卷（制造/失效日期、计量单位、初始数量）
+  GET  /materials/units                   单元列表（含数量核平与外置寿命）
+  GET  /materials/units/{uid}             单元详情（谱系链/寿命明细）
+  GET  /materials/units/{uid}/impact      引用该谱系的工单（仅这些工单需刷新）
+  POST /materials/events                  追加裁切/拆包/转移/退库/报废/解冻/纠正绑定事件
+  GET  /materials/events                  材料事件链
 """
 
 import json
@@ -21,6 +29,7 @@ import uuid
 from urllib.parse import parse_qs
 
 from . import core
+from . import genealogy as _gen
 from . import compaction as _comp
 from .store import Store
 
@@ -95,11 +104,55 @@ def make_app(db_path):
             "operator": r["operator"], "recorded_at": r["recorded_at"],
         } for r in rows]
 
+    # ------------------------------------------------------------ 材料谱系装载
+    def load_material_events():
+        with store.db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM material_events ORDER BY seq").fetchall()
+        return [{
+            "seq": r["seq"], "type": r["type"], "payload": json.loads(r["payload"]),
+            "operator": r["operator"], "recorded_at": r["recorded_at"],
+        } for r in rows]
+
+    def load_unit_usage():
+        """跨全部工单的铺层材料单元引用：{unit_id: [引用明细]}。"""
+        with store.db() as conn:
+            rows = conn.execute(
+                "SELECT job_id,seq,type,payload FROM events"
+                " WHERE type IN ('ply_placed','ply_replaced')"
+                " ORDER BY job_id,seq").fetchall()
+        usage = {}
+        for r in rows:
+            p = json.loads(r["payload"])
+            if r["type"] == "ply_placed":
+                unit, pid, at = p.get("unit"), p.get("ply_id"), p.get("placed_at")
+            else:
+                repl = p.get("replacement") or {}
+                unit = repl.get("unit")
+                pid = repl.get("ply_id", p.get("removed_ply_id"))
+                at = repl.get("placed_at")
+            if unit:
+                usage.setdefault(unit, []).append({
+                    "job_id": r["job_id"], "ply_id": pid,
+                    "event_seq": r["seq"], "placed_at": at,
+                })
+        return usage
+
+    def evaluate_materials(job_id):
+        """谱系评估（聚焦本工单）：无材料事件且无 unit 引用时返回 None。"""
+        usage = load_unit_usage()
+        mat_events = load_material_events()
+        if not mat_events and not any(
+                r["job_id"] == job_id for refs in usage.values() for r in refs):
+            return None
+        return _gen.evaluate(mat_events, usage, focus_job=job_id)
+
     def analyze_job(job_id):
         job = load_job(job_id)
         rolls = load_rolls(job_id)
         events = load_events(job_id)
-        state, violations = core.analyze(job, rolls, events)
+        state, violations = core.analyze(
+            job, rolls, events, genealogy=evaluate_materials(job_id))
         return job, rolls, events, state, violations
 
     # ------------------------------------------------------------ 处理器
@@ -293,6 +346,169 @@ def make_app(db_path):
         return 200, {"job_id": job_id, "from": a, "to": b,
                      "diff": core.diff_snapshots(sa, sb)}
 
+    # ------------------------------------------------------------ 材料谱系
+    def _insert_material_event(conn, item, now):
+        """材料事件只 INSERT；返回全局 seq。"""
+        payload = {k: v for k, v in item.items()
+                   if k not in ("type", "operator")}
+        cur = conn.execute(
+            "INSERT INTO material_events(type,payload,operator,recorded_at)"
+            " VALUES(?,?,?,?)",
+            (item["type"], json.dumps(payload, ensure_ascii=False),
+             item.get("operator"), now))
+        return cur.lastrowid
+
+    def h_create_material_unit(ctx):
+        """登记整卷：制造/失效日期、计量单位与初始数量（落 unit_registered 事件）。"""
+        b = ctx["body"]
+        missing = [k for k in ("unit_id", "batch_no", "material", "unit",
+                               "initial_qty") if k not in b]
+        if missing:
+            raise ApiError(400, {"error": "missing_fields", "fields": missing})
+        qty = b.get("initial_qty")
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)) or qty <= 0:
+            raise ApiError(400, {"error": "invalid_material_unit",
+                                 "message": "initial_qty 必须是正数"})
+        for k in ("manufactured_at", "expires_at"):
+            if b.get(k) is not None and core.parse_time(b[k]) is None:
+                raise ApiError(400, {"error": "invalid_material_unit",
+                                     "message": f"{k}={b[k]!r} 无法解析"})
+        if b["unit_id"] in _gen.known_unit_ids(load_material_events()):
+            raise ApiError(409, {"error": "unit_exists",
+                                 "unit_id": b["unit_id"]})
+        item = {"type": "unit_registered", "operator": ctx["body"].get("operator"),
+                **{k: b[k] for k in (
+                    "unit_id", "batch_no", "material", "unit", "initial_qty",
+                    "manufactured_at", "expires_at", "out_time_limit_h")
+                    if k in b}}
+        with store.db() as conn:
+            seq = _insert_material_event(conn, item, core.utcnow())
+        return 201, {"unit_id": b["unit_id"], "seq": seq}
+
+    def _validate_material_event(item, known):
+        """材料事件入链前的最小校验；业务规则（超额/成环/闭合）在分析阶段判定。"""
+        t = item.get("type")
+        if t not in _gen.EVENT_TYPES:
+            raise ApiError(400, {
+                "error": "invalid_material_event",
+                "message": f"材料事件类型须为 {sorted(_gen.EVENT_TYPES)}",
+                "type": t})
+        at = item.get("at")
+        if at is not None and core.parse_time(at) is None:
+            raise ApiError(400, {"error": "invalid_material_event",
+                                 "message": f"at={at!r} 无法解析", "type": t})
+        if t in ("unit_cut", "unit_split"):
+            if item.get("parent") not in known:
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": f"父单元 {item.get('parent')} 未登记",
+                                     "type": t})
+            children = item.get("children")
+            if not isinstance(children, list) or not children:
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": f"{t} 需要非空 children 列表",
+                                     "type": t})
+            seen = set()
+            for c in children:
+                if not isinstance(c, dict) or not c.get("unit_id"):
+                    raise ApiError(400, {"error": "invalid_material_event",
+                                         "message": "每个子单元需要 unit_id",
+                                         "type": t})
+                if c["unit_id"] in known or c["unit_id"] in seen:
+                    raise ApiError(400, {"error": "invalid_material_event",
+                                         "message": f"材料单元标识 "
+                                         f"{c['unit_id']} 已被占用",
+                                         "type": t})
+                q = c.get("qty")
+                if isinstance(q, bool) or not isinstance(q, (int, float)) or q <= 0:
+                    raise ApiError(400, {"error": "invalid_material_event",
+                                         "message": f"子单元 {c['unit_id']} 的 qty "
+                                         f"必须是正数", "type": t})
+                seen.add(c["unit_id"])
+            known.update(seen)  # 同批后续事件可引用本批生成的子单元
+        elif t == "unit_registered":
+            uid = item.get("unit_id")
+            if not uid:
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": "unit_registered 需要 unit_id",
+                                     "type": t})
+            if uid in known:
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": f"材料单元标识 {uid} 已被占用",
+                                     "type": t})
+            known.add(uid)
+        else:
+            if item.get("unit_id") not in known:
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": f"材料单元 {item.get('unit_id')} "
+                                     f"未登记", "type": t})
+            if t == "unit_rebind" and not item.get("parent"):
+                raise ApiError(400, {"error": "invalid_material_event",
+                                     "message": "unit_rebind 需要 parent", "type": t})
+
+    def h_append_material_events(ctx):
+        b = ctx["body"]
+        items = b.get("events") if isinstance(b, dict) and "events" in b else [b]
+        if not isinstance(items, list) or not items \
+                or not all(isinstance(i, dict) for i in items):
+            raise ApiError(400, {"error": "no_events"})
+        known = _gen.known_unit_ids(load_material_events())
+        for item in items:
+            _validate_material_event(item, known)
+        now = core.utcnow()
+        with store.db() as conn:
+            seqs = [_insert_material_event(conn, item, now) for item in items]
+        # 材料事件变动后，仅刷新引用该谱系的工单
+        touched = set()
+        for item in items:
+            if item["type"] in ("unit_cut", "unit_split"):
+                touched.add(item["parent"])
+                touched.update(c["unit_id"] for c in item["children"])
+            else:
+                touched.add(item.get("unit_id"))
+        affected = _gen.affected_jobs(load_material_events(), load_unit_usage(),
+                                      touched)
+        return 201, {"seqs": seqs, "affected_jobs": affected}
+
+    def h_list_material_events(ctx):
+        return 200, {"events": load_material_events()}
+
+    def _materials_view():
+        return _gen.evaluate(load_material_events(), load_unit_usage())
+
+    def h_list_material_units(ctx):
+        result = _materials_view()
+        return 200, {"units": list(result["state"]["units"].values())}
+
+    def h_get_material_unit(ctx, uid):
+        result = _materials_view()
+        u = result["state"]["units"].get(uid)
+        if u is None:
+            raise ApiError(404, {"error": "unit_not_found", "unit_id": uid})
+        return 200, {
+            **u,
+            "edges": [e for e in result["state"]["edges"]
+                      if e["child"] == uid or e["parent"] == uid],
+            "usage": [r for r in result["state"]["usage"] if r["unit"] == uid],
+            "violations": [v for v in result["violations"]
+                           if uid in v["details"].get("units", [])],
+        }
+
+    def h_material_impact(ctx, uid):
+        mat_events = load_material_events()
+        if uid not in _gen.known_unit_ids(mat_events):
+            raise ApiError(404, {"error": "unit_not_found", "unit_id": uid})
+        jobs = _gen.affected_jobs(mat_events, load_unit_usage(), {uid})
+        out = []
+        for jid in jobs:
+            try:
+                _j, _r, _e, _s, violations = analyze_job(jid)
+            except ApiError:
+                continue
+            out.append({"job_id": jid,
+                        "release": "rejected" if violations else "ok",
+                        "violation_count": len(violations)})
+        return 200, {"unit_id": uid, "affected_jobs": out}
+
     # ------------------------------------------------------------ 路由表
     routes = [
         ("POST", r"^/jobs$", h_create_job),
@@ -307,6 +523,12 @@ def make_app(db_path):
         ("GET", r"^/jobs/([^/]+)/approvals$", h_list_approvals),
         ("GET", r"^/jobs/([^/]+)/approvals/diff$", h_diff),
         ("GET", r"^/jobs/([^/]+)/approvals/(\d+)/package$", h_package),
+        ("POST", r"^/materials/units$", h_create_material_unit),
+        ("GET", r"^/materials/units$", h_list_material_units),
+        ("GET", r"^/materials/units/([^/]+)$", h_get_material_unit),
+        ("GET", r"^/materials/units/([^/]+)/impact$", h_material_impact),
+        ("POST", r"^/materials/events$", h_append_material_events),
+        ("GET", r"^/materials/events$", h_list_material_events),
     ]
 
     def app(environ, start_response):

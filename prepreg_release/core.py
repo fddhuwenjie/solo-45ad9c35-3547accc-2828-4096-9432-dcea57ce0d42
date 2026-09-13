@@ -163,8 +163,12 @@ def out_time_hours(ledger, t):
 
 # ---------------------------------------------------------------- 主分析
 
-def analyze(job, rolls, events):
-    """重建状态并执行全部放行规则。返回 (state, violations)。"""
+def analyze(job, rolls, events, genealogy=None):
+    """重建状态并执行全部放行规则。返回 (state, violations)。
+
+    genealogy 为材料谱系评估结果（genealogy.evaluate 的返回，可空）：
+    其违规并入放行判定，其状态进入 state["materials"] 供快照/随件包使用。
+    """
     spec = job["spec"] or {}
     rules = dict(DEFAULT_RULES)
     rules.update(spec.get("rules") or {})
@@ -225,6 +229,10 @@ def analyze(job, rolls, events):
         job, zones, spec_plies, stack, events)
     V.extend(comp_violations)
 
+    # ---- 材料谱系（裁切/拆包/退库/报废，外置继承与数量核平）----
+    if genealogy:
+        V.extend(genealogy.get("violations") or [])
+
     # 揭除未串替代层（规范内铺层被揭除后必须返工闭环）
     for e in stack:
         if not e["active"] and e["removed_by"] and e["replaced_by"] is None \
@@ -243,8 +251,10 @@ def analyze(job, rolls, events):
     for e in active:
         p, pid = e["payload"], e["ply_id"]
         sp_zones = (spec_by_id.get(pid) or {}).get("zones") or []
-        miss = [k for k in ("geometry", "angle", "roll", "placed_at", "face")
+        miss = [k for k in ("geometry", "angle", "placed_at", "face")
                 if p.get(k) is None]
+        if p.get("roll") is None and p.get("unit") is None:
+            miss.append("roll")  # 材料引用：roll（旧式）与 unit（谱系）至少其一
         if not e.get("operator"):
             miss.append("operator")
         if miss:
@@ -448,14 +458,14 @@ def analyze(job, rolls, events):
 
     state = _build_state(job, zones, materials, spec_plies, spec_by_id,
                          rolls, stack, active, ledger, events, thickness_of,
-                         comp_state)
+                         comp_state, genealogy)
     V.sort(key=lambda x: (x["rule"], x["plies"]))
     return state, V
 
 
 def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
                  stack, active, ledger, events, thickness_of,
-                 comp_state=None):
+                 comp_state=None, genealogy=None):
     """按层序重建的分区覆盖与厚度，以及料卷外置时间台账。"""
     plies_out = []
     for pos, e in enumerate(active, 1):
@@ -532,6 +542,9 @@ def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
         "zones": zone_state, "thickness_steps": steps, "rolls": roll_state,
         "event_count": len(events),
         "compaction": comp_state or {"checkpoints": [], "sessions": []},
+        # 材料谱系：本工单引用单元的父子关系、寿命明细与数量核平结果
+        "materials": (genealogy or {}).get("state")
+        or {"units": {}, "edges": [], "usage": []},
     }
 
 
@@ -577,6 +590,9 @@ def build_snapshot(job, rolls, events, state):
         # 阶段压实/真空袋检漏随件包：采用的压力区间、结果与事件引用
         "compaction": state.get("compaction")
         or {"checkpoints": [], "sessions": []},
+        # 材料谱系随件包：父子关系、寿命明细（继承/累计外置）与数量核平结果
+        "materials": state.get("materials")
+        or {"units": {}, "edges": [], "usage": []},
     }
 
 
@@ -637,6 +653,47 @@ def diff_snapshots(sa, sb):
                 "leak_window": {"from": a_bs.get("leak", {}).get("window"),
                                 "to": b_bs.get("leak", {}).get("window")},
             })
+    # 材料谱系：引用单元增删、父子关系、数量核平与外置寿命变化
+    def _mat_map(s):
+        return (s.get("materials") or {}).get("units") or {}
+
+    ma, mb = _mat_map(sa), _mat_map(sb)
+    parent_a = {u: d.get("parent") for u, d in ma.items()}
+    parent_b = {u: d.get("parent") for u, d in mb.items()}
+    qty_changed = []
+    out_time_changed = []
+    for u in sorted(set(ma) & set(mb)):
+        if ma[u].get("remaining_qty") != mb[u].get("remaining_qty") \
+                or ma[u].get("allocated_qty") != mb[u].get("allocated_qty") \
+                or ma[u].get("scrapped_qty") != mb[u].get("scrapped_qty") \
+                or ma[u].get("placed_qty") != mb[u].get("placed_qty"):
+            qty_changed.append({
+                "unit": u,
+                "remaining_qty": {"from": ma[u].get("remaining_qty"),
+                                  "to": mb[u].get("remaining_qty")},
+                "allocated_qty": {"from": ma[u].get("allocated_qty"),
+                                  "to": mb[u].get("allocated_qty")},
+                "scrapped_qty": {"from": ma[u].get("scrapped_qty"),
+                                 "to": mb[u].get("scrapped_qty")},
+                "placed_qty": {"from": ma[u].get("placed_qty"),
+                               "to": mb[u].get("placed_qty")},
+            })
+        if ma[u].get("out_time_h") != mb[u].get("out_time_h"):
+            out_time_changed.append({
+                "unit": u,
+                "out_time_h": {"from": ma[u].get("out_time_h"),
+                               "to": mb[u].get("out_time_h")},
+            })
+    materials_diff = {
+        "units_added": sorted(set(mb) - set(ma)),
+        "units_removed": sorted(set(ma) - set(mb)),
+        "parent_changed": [{"unit": u, "from": parent_a.get(u),
+                            "to": parent_b.get(u)}
+                           for u in sorted(set(ma) & set(mb))
+                           if parent_a.get(u) != parent_b.get(u)],
+        "qty_changed": qty_changed,
+        "out_time_changed": out_time_changed,
+    }
     return {
         "spec_changed": sa["spec_hash"] != sb["spec_hash"],
         "spec_hash": {"a": sa["spec_hash"], "b": sb["spec_hash"]},
@@ -656,4 +713,5 @@ def diff_snapshots(sa, sb):
             "checkpoint_count": {"a": len(ca), "b": len(cb)},
             "changed": compaction_changed,
         },
+        "materials": materials_diff,
     }

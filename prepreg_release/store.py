@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS approvals (
     approved_at TEXT NOT NULL,
     PRIMARY KEY (job_id, version)
 );
+
+-- 材料谱系事件链（整卷登记/裁切/拆包/转移/退库/报废/解冻/纠正绑定），
+-- 全局共享、跨工单引用；与 events 表一样只允许 INSERT
+CREATE TABLE IF NOT EXISTS material_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT NOT NULL,
+    payload     TEXT NOT NULL,          -- JSON
+    operator    TEXT,
+    recorded_at TEXT NOT NULL
+);
 """
 
 
