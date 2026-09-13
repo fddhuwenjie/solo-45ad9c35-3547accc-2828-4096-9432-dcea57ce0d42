@@ -443,7 +443,8 @@ def make_app(db_path):
         impact, conflicts = _rev.analyze(
             job, load_events(job_id), base_spec, new_spec, effective_at,
             locked_plies=_locked_ply_ids(job_id), explicit_mapping=explicit,
-            new_zones=b.get("zones"), new_tool_datum=b.get("tool_datum"))
+            new_zones=b.get("zones"), new_tool_datum=b.get("tool_datum"),
+            rolls=load_rolls(job_id))
         if conflicts:
             raise ApiError(409, {
                 "error": "spec_revision_conflict",
@@ -507,6 +508,22 @@ def make_app(db_path):
                            f"生效为 v{job['spec_revision']}，需重新提议",
                 "base_revision": row["base_revision"],
                 "current_revision": job["spec_revision"]})
+        # 提议后现场可能已变（新铺层/新批准）：按当前事件链与最新锁层
+        # 状态重算影响；仍有冲突则不得启用——修订保持 proposed，
+        # spec_revision 不切换
+        stored = json.loads(row["impact"])
+        _impact, conflicts = _rev.analyze(
+            job, load_events(job_id),
+            _revision_spec(job_id, row["base_revision"]),
+            json.loads(row["spec"]), core.parse_time(row["effective_at"]),
+            locked_plies=_locked_ply_ids(job_id),
+            explicit_mapping=stored.get("mapping") or None,
+            rolls=load_rolls(job_id))
+        if conflicts:
+            raise ApiError(409, {
+                "error": "spec_revision_conflict",
+                "message": "提议后现场状态已变化，换版存在冲突，未启用新版",
+                "conflicts": conflicts, "impact": _impact})
         with store.db() as conn:
             conn.execute(
                 "UPDATE spec_revisions SET status='confirmed', confirmed_at=?"

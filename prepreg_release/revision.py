@@ -3,8 +3,9 @@
 铺层进行到一半时，工艺规范可能因材料替代、丢层调整或开孔边界变化而
 换版。换版不改动既有铺放/材料事件（只读），而是把新规范登记为工单的
 新分支：引擎逐层比较新旧规范的材料、层序、角度、正反面、覆盖区、
-接缝与丢层边界，标出可以沿用的实铺层；中间层变化时，把必须揭除的
-上覆层、随之失效的压实检查点与待补铺层排成确定的返工序列。
+接缝与丢层边界，并核对现场实铺属性（角度/正反面/材料/覆盖）是否仍
+满足新版对应层，标出可以沿用的实铺层；中间层变化或实铺不符时，把
+必须揭除的上覆层、随之失效的压实检查点与待补铺层排成确定的返工序列。
 
 冲突（任一命中即返回 409 且不启用新版）：
   MAPPING_AMBIGUOUS        层映射多解（层号/层序重复、显式映射多对一）
@@ -20,7 +21,8 @@ import hashlib
 import json
 
 from .compaction import normalize_checkpoints
-from .core import parse_time, replay
+from .core import DEFAULT_RULES, angle_diff, parse_time, replay
+from .geometry import coverage_fraction
 
 # 逐层比较的标量字段（ply_id 由映射解决，不参与比较）
 _SCALAR_FIELDS = ("material", "angle", "face")
@@ -73,6 +75,47 @@ def _event_moment(ev):
         if t is not None:
             return t
     return parse_time((p.get("replacement") or {}).get("placed_at"))
+
+
+def _placed_nonconformity(entry, sp, rules, rolls, job_zones):
+    """实铺属性与新版对应层逐项核对（角度/正反面/材料/覆盖区）。
+
+    仅核对记录中存在的属性；缺失项由既有 DATA_MISSING 规则处置。
+    返回不符明细（空列表 = 该实铺层可沿用）。
+    """
+    p = entry["payload"]
+    out = []
+    ang, req = p.get("angle"), sp.get("angle")
+    if ang is not None and req is not None:
+        dev = angle_diff(float(ang), float(req))
+        if dev > rules["angle_tolerance_deg"]:
+            out.append({"field": "angle", "actual": ang, "required": req,
+                        "deviation_deg": round(dev, 2)})
+    if sp.get("face") and p.get("face") and p["face"] != sp["face"]:
+        out.append({"field": "face", "actual": p["face"],
+                    "required": sp["face"]})
+    actual_mat = None
+    if p.get("roll") is not None:
+        roll = rolls.get(p["roll"])
+        if roll is not None:
+            actual_mat = roll.get("material")
+    if actual_mat is None and p.get("material") is not None:
+        actual_mat = p.get("material")
+    if actual_mat and sp.get("material") and actual_mat != sp["material"]:
+        out.append({"field": "material", "actual": actual_mat,
+                    "required": sp["material"]})
+    geom = p.get("geometry")
+    if geom:
+        for zid in sp.get("zones") or []:
+            z = job_zones.get(zid)
+            if z is None:
+                continue
+            frac = coverage_fraction(z["polygon"], geom)
+            if frac < rules["coverage_min_fraction"]:
+                out.append({"field": "zones", "zone": zid,
+                            "actual": round(frac, 3),
+                            "required": rules["coverage_min_fraction"]})
+    return out
 
 
 def _build_mapping(old_plies, new_plies, explicit):
@@ -132,7 +175,7 @@ def _build_mapping(old_plies, new_plies, explicit):
 
 def analyze(job, events, base_spec, new_spec, effective_at,
             locked_plies=(), explicit_mapping=None,
-            new_zones=None, new_tool_datum=None):
+            new_zones=None, new_tool_datum=None, rolls=None):
     """换版影响分析。
 
     job               工单（zones/tool_datum 为建档基准）
@@ -143,6 +186,7 @@ def analyze(job, events, base_spec, new_spec, effective_at,
     locked_plies      已批准快照锁定的铺层号
     explicit_mapping  可选显式层映射 {新层号: 旧层号}
     new_zones / new_tool_datum  请求若试图随迁更改分区/基准
+    rolls             工单料卷台账（核对实铺材料用）
 
     返回 (impact, conflicts)；conflicts 非空时不得启用新版。映射多解时
     impact 为 None——映射不定，处置序列不可信。
@@ -219,8 +263,12 @@ def analyze(job, events, base_spec, new_spec, effective_at,
     stack, _ledger, _anomalies = replay(events)
     active = [e for e in stack if e["active"]]
     changed_old = {c["old_ply_id"] for c in changed}
+    new_by_old = {opid: npid for npid, opid in mapping.items()}
+    rules = dict(DEFAULT_RULES)
+    rules.update((new_spec or {}).get("rules") or {})
 
-    must = {}  # active 下标 → 揭除原因
+    must = {}          # active 下标 → 揭除原因
+    nc_details = {}    # active 下标 → 实铺不符明细
     for idx, e in enumerate(active):
         pid = e["ply_id"]
         if pid not in old_by_id:
@@ -229,17 +277,28 @@ def analyze(job, events, base_spec, new_spec, effective_at,
             must[idx] = "dropped"    # 新规范已删除该层
         elif pid in changed_old:
             must[idx] = "changed"    # 规范要求已变，旧实铺不再有效
+        else:
+            # 规范未变≠可沿用：实铺属性须同时满足新版对应层要求
+            sp = new_by_id.get(new_by_old.get(pid))
+            if sp is not None:
+                nc = _placed_nonconformity(e, sp, rules, rolls or {},
+                                           job_zones)
+                if nc:
+                    must[idx] = "nonconforming"
+                    nc_details[idx] = nc
     if must:
         first = min(must)
         for idx in range(first, len(active)):
             must.setdefault(idx, "overlying")  # 上覆层连带揭除
 
-    remove = [{
-        "ply_id": active[idx]["ply_id"], "pos": idx + 1,
-        "event_seq": active[idx]["event_seq"], "reason": must[idx],
-    } for idx in sorted(must, reverse=True)]  # 自上而下依次揭除
+    remove = []
+    for idx in sorted(must, reverse=True):  # 自上而下依次揭除
+        item = {"ply_id": active[idx]["ply_id"], "pos": idx + 1,
+                "event_seq": active[idx]["event_seq"], "reason": must[idx]}
+        if idx in nc_details:
+            item["details"] = nc_details[idx]
+        remove.append(item)
 
-    new_by_old = {opid: npid for npid, opid in mapping.items()}
     carry_over = [{
         "ply_id": e["ply_id"], "pos": idx + 1, "event_seq": e["event_seq"],
         "new_ply_id": new_by_old.get(e["ply_id"]),

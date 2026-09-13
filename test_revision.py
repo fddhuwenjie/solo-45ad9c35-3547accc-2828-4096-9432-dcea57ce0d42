@@ -480,5 +480,60 @@ check("老工单兼容：spec_revision=0 且校验通过",
       json.dumps({"spec_revision": job.get("spec_revision"),
                   "release": r["release"]}, ensure_ascii=False))
 
+# ---------------------------------------------------------------- 23. 回归：实铺不符新版不得沿用
+jid = new_job(compaction=True)
+call("POST", f"/jobs/{jid}/events", {"events": [
+    {"type": "roll_thawed", "operator": "op1", "roll": "R1",
+     "at": "2026-09-10T06:00:00Z"},
+    placed("P01", 15, "2026-09-10T08:00:00Z"),   # ← 实铺 15°，规范要求 0°
+    placed("P02", 45, "2026-09-10T09:00:00Z"),
+    placed("P03", -45, "2026-09-10T10:00:00Z")]})
+s, r = propose(jid, spec_with(P05={"angle": 30}))   # 新版对 P01 仍要求 0°
+imp = r.get("impact") or {}
+rw = imp.get("rework") or {}
+check("实铺 15° 而新版要求 0°：P01 不得沿用",
+      s.startswith("201") and imp.get("carry_over") == [],
+      f"[{s}] {json.dumps(imp.get('carry_over'), ensure_ascii=False)}")
+check("实铺不符纳入揭除序列：P01 nonconforming，上覆 P02/P03 连带",
+      [(x["ply_id"], x["reason"]) for x in rw.get("remove", [])]
+      == [("P03", "overlying"), ("P02", "overlying"),
+          ("P01", "nonconforming")],
+      json.dumps(rw.get("remove"), ensure_ascii=False))
+check("实铺不符明细：角度实际 15°/要求 0°",
+      (rw["remove"][-1].get("details") or [{}])[0].get("field") == "angle"
+      and rw["remove"][-1]["details"][0]["actual"] == 15
+      and rw["remove"][-1]["details"][0]["required"] == 0,
+      json.dumps(rw["remove"][-1], ensure_ascii=False))
+check("实铺不符：CP1/CP2 检查点随之失效",
+      rw.get("invalidated_checkpoints") == ["CP1", "CP2"],
+      json.dumps(rw.get("invalidated_checkpoints"), ensure_ascii=False))
+check("实铺不符：P01 纳入补铺序列（relay）",
+      ("P01", "relay") in [(x["ply_id"], x["reason"])
+                           for x in rw.get("relay", [])],
+      json.dumps(rw.get("relay"), ensure_ascii=False))
+
+# ---------------------------------------------------------------- 24. 回归：提议后新增锁层，确认须重查
+jid = new_job()
+s, r = propose(jid, spec_with(P01={"angle": 30}), reason="角度调整 0°→30°")
+rev = r["revision"]
+check("提议时 P01 未铺未锁：提议 201", s.startswith("201"), f"[{s}] {r}")
+lay(jid, 6)                       # 提议后按现行规范铺完全部 6 层
+call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe-wang"})
+s, r = call("POST", f"/jobs/{jid}/spec-revisions/{rev}/confirm")
+locked = next((c for c in r.get("conflicts", [])
+               if c["code"] == "LOCKED_PLY_AFFECTED"), {})
+check("提议后 P01 已铺并批准：确认 → 409 LOCKED_PLY_AFFECTED",
+      s.startswith("409") and "P01" in locked.get("plies", []),
+      f"[{s}] {json.dumps(r, ensure_ascii=False)[:300]}")
+_s, rr = call("GET", f"/jobs/{jid}/spec-revisions/{rev}")
+check("冲突确认后修订不得变为 confirmed",
+      rr.get("status") == "proposed",
+      json.dumps({"status": rr.get("status")}, ensure_ascii=False))
+_s, job = call("GET", f"/jobs/{jid}")
+check("冲突确认后 spec_revision 不得切换（仍为 0）",
+      job.get("spec_revision") == 0,
+      json.dumps({"spec_revision": job.get("spec_revision")},
+                 ensure_ascii=False))
+
 print(f"\n{sum(results)}/{len(results)} 通过")
 raise SystemExit(0 if all(results) else 1)

@@ -13,7 +13,7 @@ python3 run_server.py 8000        # 启动服务（生成 prepreg.db）
 python3 demo.py                   # 端到端演示（违规→返工→复压→批准→版本比较→换版→随件包）
 python3 test_rules.py             # 铺放规则覆盖测试（27 项）
 python3 test_compaction.py        # 阶段压实/真空检漏覆盖测试（33 项）
-python3 test_revision.py          # 规范换版覆盖测试（46 项）
+python3 test_revision.py          # 规范换版覆盖测试（55 项）
 ```
 
 ## 数据模型
@@ -106,10 +106,11 @@ python3 test_revision.py          # 规范换版覆盖测试（46 项）
   `mapping` 可选，用于重编号场景的显式层映射（新层号 → 旧层号），
   未提及的层按同号自动配对。
 - 引擎逐层比较材料、层序、角度、正反面、覆盖区、接缝与丢层边界，
+  并核对现场实铺属性（角度/正反面/材料/覆盖）是否仍满足新版对应层，
   返回影响分析：`carry_over`（可沿用的实铺层）、`rework.remove`
-  （确定的揭除序列，自上而下；中间层变化时上覆层连带）、
-  `rework.invalidated_checkpoints`（随之失效的压实检查点）、
-  `rework.relay`（待补铺序列，按新层序）。
+  （确定的揭除序列，自上而下；中间层变化时上覆层连带，实铺不符新版
+  的层以 `nonconforming` 纳入）、`rework.invalidated_checkpoints`
+  （随之失效的压实检查点）、`rework.relay`（待补铺序列，按新层序）。
 - 冲突时返回 **409** 且不启用新版：
   `MAPPING_AMBIGUOUS`（层映射多解）、`ZONE_DATUM_INCOMPATIBLE`
   （分区基准不兼容）、`EFFECTIVE_BEFORE_RECORDS`（生效时刻早于现场记录）、
@@ -119,7 +120,9 @@ python3 test_revision.py          # 规范换版覆盖测试（46 项）
 
 固定新规范、层映射与处置决定（propose 写入后不再更改）；此后校验、
 批准与 JSON 随件包均从该分支重算，已批准工单回到待放行状态。
-基线已过期的提议确认时返回 409 `stale_base`。返工仍通过追加
+确认前按当前事件链与最新锁层状态重算影响——提议后新增的铺放/批准
+若引入冲突（如已锁层受影响），返回 409，修订保持 proposed 且不切换
+分支。基线已过期的提议确认时返回 409 `stale_base`。返工仍通过追加
 `ply_removed` / `ply_replaced` 事件闭环。
 
 `GET /jobs/{id}/spec-revisions`、`GET /jobs/{id}/spec-revisions/{r}`
