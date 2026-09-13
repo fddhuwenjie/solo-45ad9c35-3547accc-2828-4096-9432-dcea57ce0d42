@@ -64,7 +64,10 @@ python3 test_rules.py             # 规则覆盖测试（15 项）
 | `DROP_STAGGER` | 丢层错开不足（厚度突变） |
 | `OUT_TIME_EXCEEDED` / `OUT_TIME_DATA_MISSING` | 外置时间超限 / 解冻记录缺失 |
 | `REMOVAL_WITHOUT_REPLACEMENT` / `REWORK_LINK_BROKEN` | 返工未串接揭除层与替代层 |
-| `DATA_MISSING` / `SPEC_DATA_MISSING` / `ROLL_UNKNOWN` / `MATERIAL_MISMATCH` / `ZONE_UNKNOWN` | 资料缺失或引用冲突 |
+| `DATA_MISSING` / `SPEC_DATA_MISSING` / `ROLL_UNKNOWN` / `MATERIAL_MISMATCH` / `ZONE_UNKNOWN` | 资料缺失或引用冲突（含接缝引用未定义分区） |
+| `SPEC_DUPLICATE_SEQ` / `SPEC_DUPLICATE_PLY` | 规范层序 / 层号重复 |
+| `INVALID_TIME` | 铺放时刻无法解析 |
+| `DATUM_MISSING` | 模具基准（tool_datum）缺失或为空 |
 
 每条违规都带 `plies`（层号）与 `zones`（区域）。存在任何违规时
 `POST /jobs/{id}/approve` 返回 **409** 并附完整违规清单，拒绝放行。

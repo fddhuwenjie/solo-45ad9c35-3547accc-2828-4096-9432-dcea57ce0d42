@@ -31,20 +31,25 @@ def call(method, path, body=None, query=""):
 
 
 def new_job(angles=(0, 45, -45, -45, 45, 0), extra_rules=None, drops=None,
-            roll_limit=240):
+            roll_limit=240, omit_face_for=None, dup_seq=False, datum="default"):
     plies = []
     for i, a in enumerate(angles, 1):
         p = {"seq": i, "ply_id": f"P{i:02d}", "material": "CF-EP-3K",
              "angle": a, "face": "up", "zones": ["Z1", "Z2"]}
+        if omit_face_for and p["ply_id"] in omit_face_for:
+            del p["face"]
         if drops and p["ply_id"] in drops:
             p["drop_at"] = drops[p["ply_id"]]
         plies.append(p)
+    if dup_seq:
+        plies[3]["seq"] = plies[2]["seq"]   # P04 与 P03 层序重复
     rules = {"seam_min_stagger_mm": 25.0, "seam_max_gap_mm": 1.5,
              "max_consecutive_same_angle": 4}
     if extra_rules:
         rules.update(extra_rules)
     body = {
-        "name": "test", "tool_datum": {"datum_id": "M1"},
+        "name": "test",
+        "tool_datum": {"datum_id": "M1"} if datum == "default" else datum,
         "zones": [
             {"zone_id": "Z1", "polygon": [[0, 0], [200, 0], [200, 60], [0, 60]],
              "adjacent": ["Z2"]},
@@ -60,9 +65,11 @@ def new_job(angles=(0, 45, -45, -45, 45, 0), extra_rules=None, drops=None,
     return r["job_id"]
 
 
-def placed(pid, angle, t, roll="R1", geom=FULL, face="up", **kw):
-    e = {"type": "ply_placed", "operator": "op1", "ply_id": pid, "roll": roll,
+def placed(pid, angle, t, roll="R1", geom=FULL, face="up", op="op1", **kw):
+    e = {"type": "ply_placed", "ply_id": pid, "roll": roll,
          "angle": angle, "face": face, "geometry": geom, "placed_at": t}
+    if op is not None:
+        e["operator"] = op
     e.update(kw)
     return e
 
@@ -89,6 +96,25 @@ def check(name, jid, expect, absent=()):
             print(f"     不应出现: {unexpected}")
         print(json.dumps(r["violations"], ensure_ascii=False, indent=1))
     return ok
+
+
+def find_violations(jid, rule):
+    _s, r = call("GET", f"/jobs/{jid}/validate")
+    return [v for v in r["violations"] if v["rule"] == rule]
+
+
+def approve_blocked(name, jid):
+    """错误批准路径：存在违规时批准必须返回 409，不得冻结快照。"""
+    s, r = call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe-wang"})
+    ok = s.startswith("409") and r.get("error") == "release_rejected"
+    print(f"{'PASS' if ok else 'FAIL'}  {name}: 批准被拒 [{s}]")
+    return ok
+
+
+def lay_all(jid, angles=(0, 45, -45, -45, 45, 0), **kw):
+    call("POST", f"/jobs/{jid}/events", {"events": [thaw()] + [
+        placed(f"P{i:02d}", a, f"2026-09-10T08:0{i}:00Z", **kw)
+        for i, a in enumerate(angles, 1)]})
 
 
 results = []
@@ -226,6 +252,86 @@ s, r = call("POST", f"/jobs/{jid}/events", {"type": "ply_deleted", "operator": "
 ok = s.startswith("400")
 print(f"{'PASS' if ok else 'FAIL'}  非法事件类型被拒: {s}")
 results.append(ok)
+
+# ---------------------------------------------------------------- 回归：
+# 以下均为曾错误放行（release=ok 且批准 201 冻结）的路径，现必须在
+# 校验中给出带层号/区域的违规，并在批准时返回 409。
+
+# 16. placed_at 无法解析
+jid = new_job()
+evs = [thaw()] + [placed(f"P{i:02d}", a, f"2026-09-10T08:0{i}:00Z")
+                  for i, a in enumerate([0, 45, -45, -45, 45, 0], 1)]
+evs[3]["placed_at"] = "not-a-time"          # P03 铺放时刻无法解析
+call("POST", f"/jobs/{jid}/events", {"events": evs})
+vs = find_violations(jid, "INVALID_TIME")
+ok = len(vs) == 1 and vs[0]["plies"] == ["P03"] and "Z1" in vs[0]["zones"]
+print(f"{'PASS' if ok else 'FAIL'}  placed_at 无法解析 INVALID_TIME: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: INVALID_TIME", jid))
+
+# 17. 铺层规范缺少 face
+jid = new_job(omit_face_for={"P03"})
+lay_all(jid)
+vs = find_violations(jid, "SPEC_DATA_MISSING")
+ok = any(v["plies"] == ["P03"] and "face" in v["details"].get("missing", [])
+         for v in vs)
+print(f"{'PASS' if ok else 'FAIL'}  规范缺 face SPEC_DATA_MISSING: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: 规范缺 face", jid))
+
+# 18. 规范 seq 重复
+jid = new_job(dup_seq=True)
+lay_all(jid)
+vs = find_violations(jid, "SPEC_DUPLICATE_SEQ")
+ok = len(vs) == 1 and set(vs[0]["plies"]) == {"P03", "P04"}
+print(f"{'PASS' if ok else 'FAIL'}  规范 seq 重复 SPEC_DUPLICATE_SEQ: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: seq 重复", jid))
+
+# 19. 接缝引用不存在的分区 Z404
+jid = new_job()
+call("POST", f"/jobs/{jid}/events", {"events": [thaw(),
+    placed("P01", 0, "2026-09-10T08:01:00Z"),
+    placed("P02", 45, "2026-09-10T08:02:00Z",
+           seams=[{"zone": "Z404", "axis": "x", "at": 100.0, "gap": 0.5}]),
+    placed("P03", -45, "2026-09-10T08:03:00Z"),
+    placed("P04", -45, "2026-09-10T08:04:00Z"),
+    placed("P05", 45, "2026-09-10T08:05:00Z"),
+    placed("P06", 0, "2026-09-10T08:06:00Z")]})
+vs = find_violations(jid, "ZONE_UNKNOWN")
+ok = len(vs) == 1 and vs[0]["plies"] == ["P02"] and vs[0]["zones"] == ["Z404"]
+print(f"{'PASS' if ok else 'FAIL'}  接缝引用 Z404 ZONE_UNKNOWN: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: 接缝分区 Z404", jid))
+
+# 20. tool_datum 为空
+jid = new_job(datum={})
+lay_all(jid)
+vs = find_violations(jid, "DATUM_MISSING")
+ok = len(vs) == 1
+print(f"{'PASS' if ok else 'FAIL'}  模具基准为空 DATUM_MISSING: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: tool_datum 为空", jid))
+
+# 21. 缺少 operator 的 DATA_MISSING 须带出规范已知的 Z1
+jid = new_job()
+evs = [thaw()] + [placed(f"P{i:02d}", a, f"2026-09-10T08:0{i}:00Z")
+                  for i, a in enumerate([0, 45, -45, -45, 45, 0], 1)]
+del evs[4]["operator"]                       # P04 缺 operator
+call("POST", f"/jobs/{jid}/events", {"events": evs})
+vs = find_violations(jid, "DATA_MISSING")
+ok = (len(vs) == 1 and vs[0]["plies"] == ["P04"]
+      and "operator" in vs[0]["details"].get("missing", [])
+      and "Z1" in vs[0]["zones"])
+print(f"{'PASS' if ok else 'FAIL'}  缺 operator 带出 Z1: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+results.append(approve_blocked("错误批准路径: 缺 operator", jid))
 
 print(f"\n{sum(results)}/{len(results)} 通过")
 raise SystemExit(0 if all(results) else 1)

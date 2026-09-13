@@ -176,8 +176,13 @@ def analyze(job, rolls, events):
                   "plies": [p for p in (plies or []) if p is not None],
                   "zones": zids or [], "details": details})
 
+    # ---- 模具基准 ----
+    if not job.get("tool_datum"):
+        v("DATUM_MISSING", "模具基准（tool_datum）缺失或为空，无法建立铺放坐标系")
+
     # ---- 规范自身完整性 ----
     spec_by_id = {}
+    seen_seq = {}
     for sp in spec_plies:
         miss = [k for k in ("ply_id", "seq", "material", "angle", "zones") if k not in sp]
         if miss:
@@ -185,9 +190,19 @@ def analyze(job, rolls, events):
               missing=miss)
             continue
         pid = sp["ply_id"]
+        if "face" not in sp:
+            v("SPEC_DATA_MISSING", "铺层规范缺少字段 ['face']（正反面要求）",
+              plies=[pid], missing=["face"])
         if pid in spec_by_id:
             v("SPEC_DUPLICATE_PLY", f"规范中铺层号 {pid} 重复", plies=[pid])
         spec_by_id[pid] = sp
+        sq = sp["seq"]
+        if sq in seen_seq:
+            v("SPEC_DUPLICATE_SEQ",
+              f"规范层序 {sq} 被铺层 {seen_seq[sq]} 与 {pid} 重复使用",
+              plies=[seen_seq[sq], pid], seq=sq)
+        else:
+            seen_seq[sq] = pid
         if sp["material"] not in materials:
             v("SPEC_DATA_MISSING", f"铺层 {pid} 的材料 {sp['material']} 未在材料表中定义",
               plies=[pid], material=sp["material"])
@@ -218,13 +233,19 @@ def analyze(job, rolls, events):
 
     for e in active:
         p, pid = e["payload"], e["ply_id"]
+        sp_zones = (spec_by_id.get(pid) or {}).get("zones") or []
         miss = [k for k in ("geometry", "angle", "roll", "placed_at", "face")
                 if p.get(k) is None]
         if not e.get("operator"):
             miss.append("operator")
         if miss:
             v("DATA_MISSING", f"铺层 {pid} 的铺放记录缺少字段 {miss}",
-              plies=[pid], missing=miss)
+              plies=[pid], zids=sp_zones, missing=miss)
+        placed_raw = p.get("placed_at")
+        placed = parse_time(placed_raw)
+        if placed_raw is not None and placed is None:
+            v("INVALID_TIME", f"铺层 {pid} 的铺放时刻 {placed_raw!r} 无法解析",
+              plies=[pid], zids=sp_zones, placed_at=placed_raw)
         t, _mat = thickness_of(e)
         if t is None:
             v("SPEC_DATA_MISSING", f"铺层 {pid} 缺少单层厚度定义", plies=[pid])
@@ -242,7 +263,6 @@ def analyze(job, rolls, events):
                       f"铺层 {pid} 规范材料 {sp.get('material')} 与料卷 {roll_id} "
                       f"材料 {roll['material']} 不符",
                       plies=[pid], roll=roll_id, batch_no=roll["batch_no"])
-                placed = parse_time(p.get("placed_at"))
                 lg = ledger.get(roll_id, [])
                 if placed is not None:
                     ft = first_thaw(lg)
@@ -331,6 +351,10 @@ def analyze(job, rolls, events):
                 v("DATA_MISSING", f"铺层 {e['ply_id']} 接缝记录缺少 zone/gap",
                   plies=[e["ply_id"]], zids=[s.get("zone")])
                 continue
+            if s["zone"] not in zones:
+                v("ZONE_UNKNOWN",
+                  f"铺层 {e['ply_id']} 的接缝引用未定义分区 {s['zone']}",
+                  plies=[e["ply_id"]], zids=[s["zone"]])
             if s["gap"] < 0:
                 v("SEAM_OVERLAP",
                   f"铺层 {e['ply_id']} 在分区 {s['zone']} 的接缝重叠 {-s['gap']}mm",
