@@ -8,8 +8,9 @@
 
 ```bash
 python3 run_server.py 8000        # 启动服务（生成 prepreg.db）
-python3 demo.py                   # 端到端演示（违规→返工→批准→版本比较→随件包）
-python3 test_rules.py             # 规则覆盖测试（15 项）
+python3 demo.py                   # 端到端演示（违规→返工→复压→批准→版本比较→随件包）
+python3 test_rules.py             # 铺放规则覆盖测试（27 项）
+python3 test_compaction.py        # 阶段压实/真空检漏覆盖测试（33 项）
 ```
 
 ## 数据模型

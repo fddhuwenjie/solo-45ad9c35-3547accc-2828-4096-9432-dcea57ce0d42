@@ -64,6 +64,15 @@ spec = {
     ],
     "rules": {"angle_tolerance_deg": 3.0, "seam_min_stagger_mm": 25.0,
               "seam_max_gap_mm": 1.5, "max_consecutive_same_angle": 4},
+    # 多层铺放：每 3 层做一次阶段压实 + 真空袋检漏
+    "compaction": {
+        "defaults": {"target_abs_kpa": 12.0, "hold_seconds": 120,
+                     "max_sample_interval_s": 60, "max_rise_kpa_min": 2.0,
+                     "leak_test_seconds": 120},
+        "checkpoints": [
+            {"checkpoint_id": "CP-A", "after_seq": 3},
+            {"checkpoint_id": "CP-B", "after_seq": 6}],
+    },
 }
 job = {
     "name": "机翼蒙皮-A1",
@@ -97,6 +106,27 @@ def placed(pid, angle, t, seams=None):
     return e
 
 
+def vac(t0):
+    """封袋→抽真空→达标保持（≥120s，采样间隔 60s）→隔离检漏（≥120s）→结束。"""
+    def at(sec):
+        from datetime import datetime, timedelta
+        return (datetime.fromisoformat(t0.replace("Z", "+00:00"))
+                + timedelta(seconds=sec)).isoformat().replace("+00:00", "Z")
+
+    evs = [{"type": "bag_sealed", "operator": "op-li", "at": t0},
+           {"type": "vacuum_started", "operator": "op-li", "at": at(60)}]
+    for off, pressure in [(120, 100), (180, 20), (240, 10), (300, 10),
+                          (360, 10), (420, 10)]:
+        evs.append({"type": "vacuum_reading", "operator": "op-li",
+                    "at": at(off), "pressure_kpa": pressure})
+    evs.append({"type": "pump_isolated", "operator": "op-li", "at": at(420)})
+    for off, pressure in [(480, 10.0), (540, 11.0), (600, 11.0)]:
+        evs.append({"type": "vacuum_reading", "operator": "op-li",
+                    "at": at(off), "pressure_kpa": pressure})  # 0.5 kPa/min
+    evs.append({"type": "compaction_ended", "operator": "op-li", "at": at(660)})
+    return evs
+
+
 events = [
     {"type": "roll_thawed", "operator": "op-li", "roll": "R1", "at": T0},
     placed("P01", 0, "2026-09-10T08:00:00Z"),
@@ -104,12 +134,14 @@ events = [
            seams=[{"zone": "Z1", "axis": "x", "at": 100.0, "gap": 0.6}]),
     placed("P03", -45, "2026-09-10T09:00:00Z",
            seams=[{"zone": "Z1", "axis": "x", "at": 102.0, "gap": 0.4}]),
-    placed("P04", 45, "2026-09-10T09:30:00Z"),   # ← 方向抄错：规范为 -45
+] + vac("2026-09-10T09:10:00Z") + [
+    # CP-A：铺至第 3 层后的阶段压实 + 检漏（连续达压 180s，回升 0.5kPa/min）
+    placed("P04", 45, "2026-09-10T09:40:00Z"),   # ← 方向抄错：规范为 -45
     placed("P05", 45, "2026-09-10T10:00:00Z"),
     placed("P06", 0, "2026-09-10T10:30:00Z"),
-]
+] + vac("2026-09-10T10:40:00Z")                  # CP-B：铺至第 6 层后的终压实
 status, r = call("POST", f"/jobs/{jid}/events", {"events": events})
-show("追加铺放事件（含两处错误）", status, r)
+show("追加铺放事件（含两处错误与两次真空压实）", status, r)
 
 # ---------------------------------------------------------------- 3. 校验拒绝
 status, r = call("GET", f"/jobs/{jid}/validate")
@@ -133,9 +165,11 @@ rework = [
                      "geometry": FULL, "placed_at": "2026-09-10T11:30:00Z",
                      "seams": [{"zone": "Z1", "axis": "x", "at": 140.0,
                                 "gap": 0.5}]}},
-]
+    # 揭除/替代被压实层后，受影响及后续检查点（CP-A 与 CP-B）失效，
+    # 必须追加一组封袋→抽真空→读数→隔离→结束事件重新压实：
+] + vac("2026-09-10T12:00:00Z")
 status, r = call("POST", f"/jobs/{jid}/events", {"events": rework})
-show("返工：揭除层与替代层串接", status, r)
+show("返工：揭除层与替代层串接，并追加重新压实/检漏", status, r)
 
 status, r = call("GET", f"/jobs/{jid}/validate")
 show("复检", status, r, keys=["release", "violation_count", "state_summary"])
@@ -158,4 +192,4 @@ show("版本比较 v1→v2（取自冻结快照）", status, r)
 status, r = call("GET", f"/jobs/{jid}/approvals/2/package")
 show("JSON 随件包（v2 快照）", status, r,
      keys=["package", "version", "spec_hash", "chain_hash", "material_batches",
-           "state"])
+           "state", "compaction"])

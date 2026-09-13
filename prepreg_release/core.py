@@ -18,6 +18,9 @@ from .geometry import coverage_fraction, point_in_polygon, polygon_centroid
 EVENT_TYPES = {
     "ply_placed", "ply_removed", "ply_replaced",
     "roll_thawed", "roll_refrigerated", "note",
+    # 阶段压实 / 真空袋检漏现场事件（见 compaction.py）
+    "bag_sealed", "vacuum_started", "vacuum_reading",
+    "pump_isolated", "compaction_ended",
 }
 
 DEFAULT_RULES = {
@@ -215,6 +218,12 @@ def analyze(job, rolls, events):
     stack, ledger, anomalies = replay(events)
     V.extend(anomalies)
     active = [e for e in stack if e["active"]]
+
+    # ---- 阶段压实 / 真空袋检漏（惰性导入避免与 compaction 循环依赖）----
+    from . import compaction as _comp
+    comp_state, comp_violations = _comp.evaluate_compaction(
+        job, zones, spec_plies, stack, events)
+    V.extend(comp_violations)
 
     # 揭除未串替代层（规范内铺层被揭除后必须返工闭环）
     for e in stack:
@@ -438,13 +447,15 @@ def analyze(job, rolls, events):
               plies=[s1["ply_id"], s2["ply_id"]], stagger_mm=d)
 
     state = _build_state(job, zones, materials, spec_plies, spec_by_id,
-                         rolls, stack, active, ledger, events, thickness_of)
+                         rolls, stack, active, ledger, events, thickness_of,
+                         comp_state)
     V.sort(key=lambda x: (x["rule"], x["plies"]))
     return state, V
 
 
 def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
-                 stack, active, ledger, events, thickness_of):
+                 stack, active, ledger, events, thickness_of,
+                 comp_state=None):
     """按层序重建的分区覆盖与厚度，以及料卷外置时间台账。"""
     plies_out = []
     for pos, e in enumerate(active, 1):
@@ -520,6 +531,7 @@ def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
         "ply_count": len(active), "plies": plies_out, "removed": removed_out,
         "zones": zone_state, "thickness_steps": steps, "rolls": roll_state,
         "event_count": len(events),
+        "compaction": comp_state or {"checkpoints": [], "sessions": []},
     }
 
 
@@ -562,6 +574,9 @@ def build_snapshot(job, rolls, events, state):
         "events": events,
         "chain_hash": chain_hash(events),
         "state": state,
+        # 阶段压实/真空袋检漏随件包：采用的压力区间、结果与事件引用
+        "compaction": state.get("compaction")
+        or {"checkpoints": [], "sessions": []},
     }
 
 
@@ -581,6 +596,47 @@ def diff_snapshots(sa, sb):
         tb = (zones_b.get(zid) or {}).get("thickness_mm")
         if ta != tb:
             thickness_delta[zid] = {"from": ta, "to": tb}
+    # 阶段压实检查点：状态、达压保持窗口、检漏区间/回升率与所引用事件序号
+    def _cp_map(s):
+        return {c["checkpoint_id"]: c for c in (s.get("compaction")
+                or {}).get("checkpoints") or []}
+
+    ca, cb = _cp_map(sa), _cp_map(sb)
+    compaction_changed = []
+    for cid in sorted(set(ca) | set(cb)):
+        a, b = ca.get(cid), cb.get(cid)
+        if a is None or b is None:
+            compaction_changed.append({
+                "checkpoint_id": cid,
+                "status": {"from": a and a["status"], "to": b and b["status"]}})
+            continue
+
+        def _sig(c):
+            bs = c.get("bound_session") or {}
+            hold, leak = bs.get("hold") or {}, bs.get("leak") or {}
+            evs = bs.get("events") or {}
+            return (c["status"],
+                    hold.get("achieved_seconds"), hold.get("best_window"),
+                    leak.get("rise_rate_kpa_min"), leak.get("window"),
+                    evs.get("bag_sealed"), evs.get("pump_isolated"),
+                    evs.get("compaction_ended"))
+
+        if _sig(a) != _sig(b):
+            a_bs, b_bs = a.get("bound_session") or {}, b.get("bound_session") or {}
+            compaction_changed.append({
+                "checkpoint_id": cid,
+                "status": {"from": a["status"], "to": b["status"]},
+                "bag_sealed_event": {"from": (a_bs.get("events") or {}).get("bag_sealed"),
+                                     "to": (b_bs.get("events") or {}).get("bag_sealed")},
+                "hold_seconds": {"from": a_bs.get("hold", {}).get("achieved_seconds"),
+                                 "to": b_bs.get("hold", {}).get("achieved_seconds")},
+                "hold_window": {"from": a_bs.get("hold", {}).get("best_window"),
+                                "to": b_bs.get("hold", {}).get("best_window")},
+                "rise_rate_kpa_min": {"from": a_bs.get("leak", {}).get("rise_rate_kpa_min"),
+                                      "to": b_bs.get("leak", {}).get("rise_rate_kpa_min")},
+                "leak_window": {"from": a_bs.get("leak", {}).get("window"),
+                                "to": b_bs.get("leak", {}).get("window")},
+            })
     return {
         "spec_changed": sa["spec_hash"] != sb["spec_hash"],
         "spec_hash": {"a": sa["spec_hash"], "b": sb["spec_hash"]},
@@ -596,4 +652,8 @@ def diff_snapshots(sa, sb):
         },
         "thickness_delta_mm": thickness_delta,
         "ply_count": {"a": sa["state"]["ply_count"], "b": sb["state"]["ply_count"]},
+        "compaction": {
+            "checkpoint_count": {"a": len(ca), "b": len(cb)},
+            "changed": compaction_changed,
+        },
     }

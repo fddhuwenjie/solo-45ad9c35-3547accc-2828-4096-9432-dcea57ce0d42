@@ -5,9 +5,9 @@
   GET  /jobs                              列表
   GET  /jobs/{id}                         详情
   POST /jobs/{id}/rolls                   登记料卷
-  POST /jobs/{id}/events                  追加铺放事件（只允许追加）
+  POST /jobs/{id}/events                  追加铺放/压实事件（只允许追加）
   GET  /jobs/{id}/events                  事件链
-  GET  /jobs/{id}/state                   重建的分区覆盖/厚度/外置时间
+  GET  /jobs/{id}/state                   重建的分区覆盖/厚度/外置时间/压实检查点
   GET  /jobs/{id}/validate                放行规则校验（违规含层号与区域）
   POST /jobs/{id}/approve                 批准放行（冻结快照）
   GET  /jobs/{id}/approvals               批准版列表
@@ -21,7 +21,32 @@ import uuid
 from urllib.parse import parse_qs
 
 from . import core
+from . import compaction as _comp
 from .store import Store
+
+
+def _validate_compaction_item(item):
+    """压实现场事件入链前的最小载荷校验；阈值类核算在 analyze 阶段进行。"""
+    t = item["type"]
+    if not item.get("at"):
+        raise ApiError(400, {"error": "invalid_compaction_event",
+                             "message": f"{t} 事件需要可解析的 at 时标", "type": t})
+    if core.parse_time(item["at"]) is None:
+        raise ApiError(400, {"error": "invalid_compaction_event",
+                             "message": f"{t} 事件 at={item['at']!r} 无法解析",
+                             "type": t})
+    if t == "vacuum_reading":
+        p = item.get("pressure_kpa")
+        if isinstance(p, bool) or not isinstance(p, (int, float)):
+            raise ApiError(400, {"error": "invalid_compaction_event",
+                                 "message": "vacuum_reading 需要数值 pressure_kpa（绝对压力 kPa）",
+                                 "type": t})
+    if t == "bag_sealed" and "zones" in item and (
+            not isinstance(item["zones"], list)
+            or not all(isinstance(z, str) for z in item["zones"])):
+        raise ApiError(400, {"error": "invalid_compaction_event",
+                             "message": "bag_sealed 的 zones 必须为字符串列表",
+                             "type": t})
 
 _STATUS = {
     200: "200 OK", 201: "201 Created", 400: "400 Bad Request",
@@ -155,6 +180,8 @@ def make_app(db_path):
                     raise ApiError(400, {
                         "error": "invalid_rework",
                         "message": "返工事件必须同时给出 removed_ply_id 与 replacement"})
+                if item["type"] in _comp.STAGE_EVENTS:
+                    _validate_compaction_item(item)
                 seq += 1
                 payload = {k: v for k, v in item.items()
                            if k not in ("type", "operator")}
@@ -189,6 +216,14 @@ def make_app(db_path):
                 "ply_count": state["ply_count"],
                 "zones": state["zones"],
                 "rolls": state["rolls"],
+                "compaction": {
+                    "checkpoints": [{
+                        "checkpoint_id": c["checkpoint_id"],
+                        "status": c["status"],
+                        "after_seq": c["after_seq"],
+                        "zones": c["zones"],
+                    } for c in state["compaction"]["checkpoints"]],
+                },
             },
         }
 
