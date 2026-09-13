@@ -93,7 +93,7 @@ def _remaining(u, before=None):
     for s in u["scraps"]:
         if before is not None and s["at"] is not None and s["at"] > before:
             continue
-        rem -= s["qty"]
+        rem -= s["qty"] or 0.0  # 缺省报废量未解析（无有效初始数量）时按 0 计
     return rem
 
 
@@ -272,7 +272,7 @@ def _replay_cut(units, ev, prob):
     consumed = declared if declared is not None else total
     # 超额分配在重放后的数量核平阶段按最终台账判定（纠正绑定会转移归属）
     parent["cuts"].append({"event": seq, "at": at, "consumed": consumed,
-                           "children": made})
+                           "children": made, "kind": t})
 
 
 # ---------------------------------------------------------------- 主评估
@@ -396,7 +396,7 @@ def evaluate(events, usage, focus_job=None):
             np = units[new_parent]
             np["cuts"].append({"event": seq, "at": parse_time(p.get("at")),
                                "consumed": u["qty"] or 0.0,
-                               "children": [u["unit_id"]]})
+                               "children": [u["unit_id"]], "kind": t})
             u["rebinds"].append({"event": seq, "parent": new_parent,
                                  "at": parse_time(p.get("at")),
                                  "reason": p.get("reason")})
@@ -407,7 +407,56 @@ def evaluate(events, usage, focus_job=None):
                      f"{new_parent} 之下，但子单元产生时刻早于新父单元",
                      [u["unit_id"], new_parent], event=seq)
 
-    # ---------------- 2. 谱系成环 ----------------
+    # ---------------- 2. 数量核平（基于纠正绑定后的最终台账） ----------------
+    # 按事件序重放每单元的扣减（裁切/拆包分出、报废、纠正绑定转入），
+    # 识别超额分配；缺省报废量按事件发生时的剩余量解析，避免 None 参与汇总。
+    _VERB = {"unit_cut": "裁切", "unit_split": "拆包", "unit_rebind": "纠正绑定"}
+    for uid in sorted(units):
+        u = units[uid]
+        if not u["qty"]:
+            continue  # 整卷未登记有效初始数量：QTY_NOT_CLOSED 在步骤 5 报
+        debits = [(c["event"], "cut", c) for c in u["cuts"]]
+        debits += [(s["event"], "scrap", s) for s in u["scraps"]]
+        debits.sort(key=lambda d: d[0])
+        avail = u["qty"]
+        for seq, kind, d in debits:
+            if kind == "cut":
+                amt = d["consumed"]
+                if amt > avail + QTY_TOL:
+                    prob("UNIT_OVER_ALLOCATED",
+                         f"{_VERB.get(d['kind'], '裁切')}事件 #{seq} 从 {uid} "
+                         f"分出 {amt:g}，超过其剩余 {round(avail, 6):g}"
+                         f"（超额分配）",
+                         [uid] + list(d["children"]), event=seq,
+                         consumed=amt, remaining=round(avail, 6))
+                avail -= amt
+            else:
+                if d["qty"] is None:
+                    d["qty"] = max(avail, 0.0)  # 缺省报废量 = 当时剩余
+                elif d["qty"] > avail + QTY_TOL:
+                    prob("UNIT_OVER_ALLOCATED",
+                         f"报废事件 #{seq} 报废 {d['qty']:g}，超过单元 {uid} "
+                         f"剩余 {round(avail, 6):g}",
+                         [uid], event=seq,
+                         qty=d["qty"], remaining=round(avail, 6))
+                avail -= d["qty"]
+        # 退库声明量对账：按事件序定位当时核算剩余
+        for r in u["returns"]:
+            if r["qty"] is None:
+                continue
+            rem = u["qty"]
+            rem -= sum(c["consumed"] for c in u["cuts"]
+                       if c["event"] < r["event"])
+            rem -= sum(s["qty"] for s in u["scraps"]
+                       if s["event"] < r["event"])
+            if abs(r["qty"] - rem) > QTY_TOL:
+                prob("QTY_NOT_CLOSED",
+                     f"退库事件 #{r['event']} 声明退回 {r['qty']:g}，与单元 "
+                     f"{uid} 核算剩余 {round(rem, 6):g} 不符，数量无法闭合",
+                     [uid], event=r["event"],
+                     declared=r["qty"], remaining=round(rem, 6))
+
+    # ---------------- 3. 谱系成环 ----------------
     reported = set()
     for uid in sorted(units):
         seen, cur = [], uid
@@ -426,7 +475,7 @@ def evaluate(events, usage, focus_job=None):
             seen.append(cur)
             cur = units[cur]["parent"]
 
-    # ---------------- 3. 解冻台账缺段（逐单元一次） ----------------
+    # ---------------- 4. 解冻台账缺段（逐单元一次） ----------------
     for uid in sorted(units):
         u = units[uid]
         state = "fridge"
@@ -445,7 +494,7 @@ def evaluate(events, usage, focus_job=None):
                      f"解冻记录缺段", [uid], event=seq)
             state = "thaw" if kind == "thaw" else "fridge"
 
-    # ---------------- 4. 整卷初始数量 ----------------
+    # ---------------- 5. 整卷初始数量 ----------------
     for uid in sorted(units):
         u = units[uid]
         if u["kind"] == "roll" and not u["qty"]:
@@ -453,7 +502,7 @@ def evaluate(events, usage, focus_job=None):
                  f"整卷 {uid} 未登记有效初始数量，数量无法闭合",
                  [uid], event=u["born_event"])
 
-    # ---------------- 5. 铺层引用（裁片消耗与使用拦截） ----------------
+    # ---------------- 6. 铺层引用（裁片消耗与使用拦截） ----------------
     for uid in sorted(usage):
         refs = usage[uid]
         u = units.get(uid)
@@ -508,7 +557,7 @@ def evaluate(events, usage, focus_job=None):
                  [uid], refs=[first], remaining=round(avail, 6))
         u["placed_qty"] = max(avail, 0.0) if u["qty"] else 0.0
 
-    # ---------------- 6. 汇总状态 ----------------
+    # ---------------- 7. 汇总状态 ----------------
     latest = None
     for ev in events:
         ts = parse_time(ev["payload"].get("at")) or parse_time(ev.get("recorded_at"))
@@ -536,7 +585,7 @@ def evaluate(events, usage, focus_job=None):
             "expires_at": _inherit(units, uid, "expires_at"),
             "qty": u["qty"],
             "allocated_qty": round(sum(c["consumed"] for c in u["cuts"]), 6),
-            "scrapped_qty": round(sum(s["qty"] for s in u["scraps"]), 6),
+            "scrapped_qty": round(sum(s["qty"] or 0.0 for s in u["scraps"]), 6),
             "placed_qty": round(u["placed_qty"], 6),
             "remaining_qty": round(_remaining(u), 6),
             "status": u["status"],
@@ -565,7 +614,7 @@ def evaluate(events, usage, focus_job=None):
                     if placed is not None and uid in units else None,
             })
 
-    # ---------------- 7. 违规整理（谱系闭包 → 受影响工单/层） ----------------
+    # ---------------- 8. 违规整理（谱系闭包 → 受影响工单/层） ----------------
     parent_map = {uid: u["parent"] for uid, u in units.items()}
     V = []
     for p in raw:
@@ -589,7 +638,7 @@ def evaluate(events, usage, focus_job=None):
                         "refs": p["refs"]},
         })
 
-    # ---------------- 8. focus 裁剪谱系视图 ----------------
+    # ---------------- 9. focus 裁剪谱系视图 ----------------
     if focus_job is not None:
         referenced = {uid for uid, refs in usage.items()
                       if any(r["job_id"] == focus_job for r in refs)}

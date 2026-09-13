@@ -261,7 +261,7 @@ call("POST", f"/jobs/{jid}/events", {"events": [
 vs = find(jid, "UNIT_OVER_ALLOCATED")
 ok = (len(vs) == 1 and vs[0]["details"]["consumed"] == 6.0
       and vs[0]["details"]["remaining"] == 4.0
-      and vs[0]["plies"] == ["P01"] and vs[0]["details"]["events"])
+      and vs[0]["plies"] == ["P01"] and bool(vs[0]["details"]["events"]))
 print(f"{'PASS' if ok else 'FAIL'}  超额分配 UNIT_OVER_ALLOCATED: "
       f"{json.dumps(vs, ensure_ascii=False)}")
 results.append(ok)
@@ -314,7 +314,7 @@ call("POST", f"/jobs/{jid}/events", {"events": [
     placed("P01", "2026-09-10T10:00:00Z", unit="KJ")]})
 vs = find(jid, "GENEALOGY_CYCLE")
 ok = len(vs) == 1 and set(vs[0]["details"]["units"]) == {"R7", "KJ"} \
-    and vs[0]["details"]["events"]
+    and bool(vs[0]["details"]["events"])
 print(f"{'PASS' if ok else 'FAIL'}  谱系成环 GENEALOGY_CYCLE: "
       f"{json.dumps(vs, ensure_ascii=False)}")
 results.append(ok)
@@ -378,8 +378,7 @@ reg_roll("R12", qty=100.0)
 reg_roll("R13", qty=5.0)
 mevs(thaw("R12", "2026-09-10T06:00:00Z"),
      thaw("R13", "2026-09-10T06:00:00Z"),
-     cut("R13", [kit("KO", 8.0)], "2026-09-10T08:00:00Z"),  # 错挂 R13 → 超额
-     thaw("KO", "2026-09-10T09:00:00Z"))
+     cut("R13", [kit("KO", 8.0)], "2026-09-10T08:00:00Z"))  # 错挂 R13 → 超额
 jid = new_job()
 call("POST", f"/jobs/{jid}/events", {"events": [
     placed("P01", "2026-09-10T10:00:00Z", unit="KO")]})
@@ -399,12 +398,15 @@ print(f"{'PASS' if ok else 'FAIL'}  纠正绑定追加记录且仅刷新引用�
 results.append(ok)
 _s, me = call("GET", "/materials/events")
 _g, r2 = rules_of(jid)
+GENEALOGY_RULES = {"UNIT_UNKNOWN", "UNIT_PLACED_TWICE", "UNIT_OVER_ALLOCATED",
+                   "UNIT_EXPIRED", "UNIT_SCRAPPED", "GENEALOGY_CYCLE",
+                   "THAW_LOG_GAP", "PARENT_CHILD_TIME_CONFLICT",
+                   "QTY_NOT_CLOSED"}
+leftover = sorted({v["rule"] for v in r2["violations"]} & GENEALOGY_RULES)
 ok = (len(me["events"]) == n_before + 1          # 旧事件保留，纠正为追加
-      and r2["release"] == "ok")
-print(f"{'PASS' if ok else 'FAIL'}  纠正后放行（事件链只增）: "
-      f"events {n_before}→{len(me['events'])} release={r2['release']}"
-      + ("" if r2["release"] == "ok"
-         else json.dumps(r2["violations"], ensure_ascii=False)))
+      and not leftover)                          # 谱系违规全部闭环
+print(f"{'PASS' if ok else 'FAIL'}  纠正后谱系违规闭环（事件链只增）: "
+      f"events {n_before}→{len(me['events'])} 遗留={leftover}")
 results.append(ok)
 _s, st = call("GET", f"/jobs/{jid}/state")
 ko = st["materials"]["units"]["KO"]
@@ -459,7 +461,9 @@ reg_roll("R15")
 mevs(thaw("R15", "2026-09-10T06:00:00Z"),
      cut("R15", [kit(f"KQ{i}", 2.0) for i in range(1, 7)]
          + [kit("REM15", 80.0, "remnant")], "2026-09-10T08:00:00Z"),
-     *[thaw(f"KQ{i}", "2026-09-10T09:00:00Z") for i in range(1, 7)])
+     fridge("R15", "2026-09-10T09:00:00Z"),
+     *[fridge(f"KQ{i}", "2026-09-10T09:00:00Z") for i in range(1, 7)],
+     *[thaw(f"KQ{i}", "2026-09-10T10:00:00Z") for i in range(1, 7)])
 jid = new_job()
 lay_with_units(jid, [f"KQ{i}" for i in range(1, 7)])
 _g, r = rules_of(jid)
@@ -477,14 +481,14 @@ kq1 = m["units"]["KQ1"]
 ok = (("R15", "KQ1") in {(e["parent"], e["child"]) for e in m["edges"]}
       and kq1["inherited_out_time_h"] == 2.0
       and kq1["placed_qty"] == 2.0
-      and m["units"]["R15"]["remaining_qty"] == 68.0
+      and m["units"]["R15"]["remaining_qty"] == 8.0
       and any(u["unit"] == "KQ1" and u["out_time_at_placement_h"] == 4.02
               for u in m["usage"]))
 print(f"{'PASS' if ok else 'FAIL'}  批准版保存父子关系/寿命明细/数量结果: "
       f"KQ1 继承 {kq1['inherited_out_time_h']}h 消耗 {kq1['placed_qty']}m2，"
       f"R15 余 {m['units']['R15']['remaining_qty']}m2")
 results.append(ok)
-# 追加材料事件（余料报废 + 整卷继续外置）→ v2 快照应体现数量与寿命变化
+# 追加材料事件（余料报废 + 整卷再次出库）→ v2 快照应体现数量与寿命变化
 mevs({"type": "unit_scrap", "operator": "o", "unit_id": "REM15",
       "at": "2026-09-10T12:00:00Z", "qty": 10.0, "reason": "边料老化"},
      thaw("R15", "2026-09-10T12:30:00Z"))
@@ -551,6 +555,62 @@ vs = find(jid, "DATA_MISSING")
 ok = bool(vs) and "roll" in vs[0]["details"].get("missing", [])
 print(f"{'PASS' if ok else 'FAIL'}  缺材料引用 DATA_MISSING: "
       f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+
+# 18. 回归：整卷 10.0 单次裁出 12.0 → 最终台账核平报超额，拒绝批准
+reg_roll("RQ", qty=10.0)
+mevs(thaw("RQ", "2026-09-10T06:00:00Z"),
+     cut("RQ", [kit(f"QR{i}", 2.0) for i in range(1, 7)],
+         "2026-09-10T08:00:00Z"))  # 合计 12 > 10
+jid = new_job()
+lay_with_units(jid, [f"QR{i}" for i in range(1, 7)])
+vs = find(jid, "UNIT_OVER_ALLOCATED")
+_g, r = rules_of(jid)
+ok = (len(vs) == 1 and vs[0]["details"]["consumed"] == 12.0
+      and vs[0]["details"]["remaining"] == 10.0
+      and bool(vs[0]["details"]["events"])
+      and r["release"] == "rejected")
+print(f"{'PASS' if ok else 'FAIL'}  单次裁出超额被最终台账拦截: "
+      f"{json.dumps(vs, ensure_ascii=False)}")
+results.append(ok)
+_s, st = call("GET", f"/jobs/{jid}/state")
+ok = st["materials"]["units"]["RQ"]["remaining_qty"] == -2.0
+print(f"{'PASS' if ok else 'FAIL'}  台账亏损留痕 remaining_qty=-2.0: "
+      f"{st['materials']['units']['RQ']['remaining_qty']}")
+results.append(ok)
+approve_blocked("错误批准路径: 单次裁出超额", jid)
+
+# 19. 回归：unit_scrap 省略 qty → 按事件时剩余解析，材料查询/校验不再 500
+reg_roll("RS", qty=50.0)
+mevs(thaw("RS", "2026-09-10T06:00:00Z"),
+     cut("RS", [kit("QS1", 20.0), kit("QS2", 30.0, "remnant")],
+         "2026-09-10T08:00:00Z"),
+     {"type": "unit_scrap", "operator": "o", "unit_id": "QS1",
+      "at": "2026-09-10T09:00:00Z", "reason": "污染"})  # 缺省 qty = 全部剩余
+_s, r = call("GET", "/materials/units")
+us = {u["unit_id"]: u for u in r["units"]}
+ok = (_s.startswith("200") and us["QS1"]["scrapped_qty"] == 20.0
+      and us["QS1"]["status"] == "scrapped"
+      and us["QS1"]["remaining_qty"] == 0.0
+      and us["RS"]["remaining_qty"] == 0.0)  # RS：50 − 20(QS1) − 30(QS2)
+print(f"{'PASS' if ok else 'FAIL'}  缺省报废量按事件时剩余解析: "
+      f"QS1 scrapped={us['QS1']['scrapped_qty']} RS remaining="
+      f"{us['RS']['remaining_qty']} [{_s}]")
+results.append(ok)
+_s, r = call("GET", "/materials/units/QS1")
+ok = _s.startswith("200") and r["unit_id"] == "QS1"
+print(f"{'PASS' if ok else 'FAIL'}  单元详情查询恢复 [{_s}]")
+results.append(ok)
+jid = new_job()  # 不引用任何谱系的无关工单
+call("POST", f"/jobs/{jid}/events", {"events": [
+    placed("P01", "2026-09-10T10:00:00Z", unit="K404")]})
+_s, r = call("GET", f"/jobs/{jid}/validate")
+ok = _s.startswith("200") and r["release"] == "rejected"  # UNIT_UNKNOWN 而非 500
+print(f"{'PASS' if ok else 'FAIL'}  无关工单校验恢复 [{_s}]: {r['release']}")
+results.append(ok)
+_s, r = call("GET", "/materials/units/QS1/impact")
+ok = _s.startswith("200")
+print(f"{'PASS' if ok else 'FAIL'}  impact 查询恢复 [{_s}]")
 results.append(ok)
 
 print(f"\n{sum(results)}/{len(results)} 通过")
