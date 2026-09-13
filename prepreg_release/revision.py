@@ -225,6 +225,27 @@ def analyze(job, events, base_spec, new_spec, effective_at,
                            f"工单未定义的分区 {unknown}",
                 "zones": unknown})
 
+    # ---- 环境限值块合法性（非法块不得随换版生效）----
+    from .environment import normalize_environment
+    env_cfg, env_issues = normalize_environment(new_spec or {})
+    for iss in env_issues:
+        conflicts.append({
+            "code": "ENV_SPEC_INVALID",
+            "message": f"新规范 environment 限值块非法：{iss['message']}",
+            "detail": iss.get("detail") or {}})
+    for zid in env_cfg["zones"]:
+        if zid not in job_zones:
+            conflicts.append({
+                "code": "ZONE_DATUM_INCOMPATIBLE",
+                "message": f"新规范环境限值引用工单未定义的分区 {zid}",
+                "zones": [zid]})
+    for mat in env_cfg["materials"]:
+        if mat not in ((new_spec or {}).get("materials") or {}):
+            conflicts.append({
+                "code": "ENV_SPEC_INVALID",
+                "message": f"新规范环境限值引用未定义材料 {mat}",
+                "detail": {"material": mat}})
+
     # ---- 生效时刻不得早于现场记录 ----
     moments = [m for m in (_event_moment(ev) for ev in events) if m]
     if effective_at is not None and moments:

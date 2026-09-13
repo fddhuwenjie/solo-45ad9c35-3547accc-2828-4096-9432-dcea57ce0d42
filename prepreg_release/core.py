@@ -21,6 +21,9 @@ EVENT_TYPES = {
     # 阶段压实 / 真空袋检漏现场事件（见 compaction.py）
     "bag_sealed", "vacuum_started", "vacuum_reading",
     "pump_isolated", "compaction_ended",
+    # 开袋回温 / 环境暴露现场事件（见 environment.py）
+    "package_opened", "material_temp_reading", "environment_reading",
+    "layup_paused", "surface_covered", "layup_resumed",
 }
 
 DEFAULT_RULES = {
@@ -228,6 +231,13 @@ def analyze(job, rolls, events, genealogy=None):
     comp_state, comp_violations = _comp.evaluate_compaction(
         job, zones, spec_plies, stack, events)
     V.extend(comp_violations)
+
+    # ---- 开袋回温 / 环境暴露（开袋、测温、读数、暂停/覆盖/恢复）----
+    from . import environment as _env
+    env_state, env_violations = _env.evaluate_environment(
+        job, spec, zones, spec_by_id, materials, stack, events,
+        ledger, genealogy, rolls)
+    V.extend(env_violations)
 
     # ---- 材料谱系（裁切/拆包/退库/报废，外置继承与数量核平）----
     if genealogy:
@@ -458,14 +468,14 @@ def analyze(job, rolls, events, genealogy=None):
 
     state = _build_state(job, zones, materials, spec_plies, spec_by_id,
                          rolls, stack, active, ledger, events, thickness_of,
-                         comp_state, genealogy)
+                         comp_state, genealogy, env_state)
     V.sort(key=lambda x: (x["rule"], x["plies"]))
     return state, V
 
 
 def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
                  stack, active, ledger, events, thickness_of,
-                 comp_state=None, genealogy=None):
+                 comp_state=None, genealogy=None, env_state=None):
     """按层序重建的分区覆盖与厚度，以及料卷外置时间台账。"""
     plies_out = []
     for pos, e in enumerate(active, 1):
@@ -545,6 +555,12 @@ def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
         # 材料谱系：本工单引用单元的父子关系、寿命明细与数量核平结果
         "materials": (genealogy or {}).get("state")
         or {"units": {}, "edges": [], "usage": []},
+        # 开袋回温/环境暴露：采用的环境序列、暴露区间、覆盖窗与修订决定
+        "environment": env_state
+        or {"enabled": False, "events": [], "ambient_series": [],
+            "material_temp_series": [], "material_intervals": [],
+            "surface_intervals": [], "cover_windows": [],
+            "bag_windows": [], "decisions": []},
     }
 
 
@@ -593,6 +609,12 @@ def build_snapshot(job, rolls, events, state):
         # 材料谱系随件包：父子关系、寿命明细（继承/累计外置）与数量核平结果
         "materials": state.get("materials")
         or {"units": {}, "edges": [], "usage": []},
+        # 开袋回温/环境暴露随件包：限值、采用的读数序列、暴露区间与修订决定
+        "environment": state.get("environment")
+        or {"enabled": False, "events": [], "ambient_series": [],
+            "material_temp_series": [], "material_intervals": [],
+            "surface_intervals": [], "cover_windows": [],
+            "bag_windows": [], "decisions": []},
     }
 
 
@@ -694,6 +716,54 @@ def diff_snapshots(sa, sb):
         "qty_changed": qty_changed,
         "out_time_changed": out_time_changed,
     }
+    # 开袋回温/环境暴露：事件、读数序列、暴露区间与修订决定的版本差异
+    def _env(s):
+        return s.get("environment") or {}
+
+    ea, eb = _env(sa), _env(sb)
+
+    def _series_sig(e):
+        return sorted(
+            (r.get("event_seq"), r.get("at"), r.get("zone"),
+             r.get("temp_c"), r.get("rh_pct"), r.get("superseded_by"))
+            for r in e.get("ambient_series") or [])
+
+    def _mt_sig(e):
+        return sorted(
+            (r.get("event_seq"), r.get("at"), r.get("unit"),
+             r.get("temp_c"), r.get("superseded_by"))
+            for r in e.get("material_temp_series") or [])
+
+    def _mat_iv_sig(e):
+        return sorted(
+            (m.get("unit"), m.get("open_event"), m.get("opened_at"),
+             m.get("closed_at"), m.get("close_reason"))
+            for m in e.get("material_intervals") or [])
+
+    def _surf_sig(e):
+        return sorted(
+            (p.get("ply_id"), p.get("zone"), p.get("unit"),
+             json.dumps(p.get("exposure_intervals"), sort_keys=True,
+                        ensure_ascii=False))
+            for p in e.get("surface_intervals") or [])
+
+    def _dec_sig(e):
+        return sorted(json.dumps(d, sort_keys=True, ensure_ascii=False)
+                      for d in e.get("decisions") or [])
+
+    env_seqs_a = {x["seq"] for x in ea.get("events") or []}
+    env_seqs_b = {x["seq"] for x in eb.get("events") or []}
+    environment_diff = {
+        "enabled": {"a": bool(ea.get("enabled")),
+                    "b": bool(eb.get("enabled"))},
+        "events_added": sorted(env_seqs_b - env_seqs_a),
+        "ambient_series_changed": _series_sig(ea) != _series_sig(eb),
+        "material_temp_series_changed": _mt_sig(ea) != _mt_sig(eb),
+        "material_intervals_changed": _mat_iv_sig(ea) != _mat_iv_sig(eb),
+        "surface_intervals_changed": _surf_sig(ea) != _surf_sig(eb),
+        "decisions_changed": _dec_sig(ea) != _dec_sig(eb),
+        "decisions_added": sorted(set(_dec_sig(eb)) - set(_dec_sig(ea))),
+    }
     return {
         "spec_changed": sa["spec_hash"] != sb["spec_hash"],
         "spec_hash": {"a": sa["spec_hash"], "b": sb["spec_hash"]},
@@ -714,4 +784,5 @@ def diff_snapshots(sa, sb):
             "changed": compaction_changed,
         },
         "materials": materials_diff,
+        "environment": environment_diff,
     }

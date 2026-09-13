@@ -40,6 +40,7 @@ from . import core
 from . import genealogy as _gen
 from . import compaction as _comp
 from . import revision as _rev
+from . import environment as _env
 from .store import Store
 
 
@@ -253,6 +254,12 @@ def make_app(db_path):
                         "message": "返工事件必须同时给出 removed_ply_id 与 replacement"})
                 if item["type"] in _comp.STAGE_EVENTS:
                     _validate_compaction_item(item)
+                if item["type"] in _env.ENV_EVENT_TYPES:
+                    msg = _env.validate_event_item(item)
+                    if msg:
+                        raise ApiError(400, {
+                            "error": "invalid_environment_event",
+                            "message": msg, "type": item["type"]})
                 seq += 1
                 payload = {k: v for k, v in item.items()
                            if k not in ("type", "operator")}
@@ -294,6 +301,19 @@ def make_app(db_path):
                         "after_seq": c["after_seq"],
                         "zones": c["zones"],
                     } for c in state["compaction"]["checkpoints"]],
+                },
+                "environment": {
+                    "enabled": state["environment"].get("enabled", False),
+                    "event_count": len(state["environment"].get("events") or []),
+                    "ambient_count": len(
+                        state["environment"].get("ambient_series") or []),
+                    "material_temp_count": len(
+                        state["environment"].get("material_temp_series") or []),
+                    "material_intervals": len(
+                        state["environment"].get("material_intervals") or []),
+                    "surface_intervals": len(
+                        state["environment"].get("surface_intervals") or []),
+                    "decisions": state["environment"].get("decisions") or [],
                 },
             },
         }
