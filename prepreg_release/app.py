@@ -41,6 +41,7 @@ from . import genealogy as _gen
 from . import compaction as _comp
 from . import revision as _rev
 from . import environment as _env
+from . import defects as _def
 from .store import Store
 
 
@@ -166,12 +167,44 @@ def make_app(db_path):
             return None
         return _gen.evaluate(mat_events, usage, focus_job=job_id)
 
+    def _confirmed_revision_context(job_id):
+        """已确认换版记录（含基线规范全文），供缺陷签发的换版撤销判定。"""
+        with store.db() as conn:
+            rows = conn.execute(
+                "SELECT revision,base_revision,spec,confirmed_at"
+                " FROM spec_revisions WHERE job_id=? AND status='confirmed'"
+                " ORDER BY revision", (job_id,)).fetchall()
+            base_row = conn.execute(
+                "SELECT spec FROM jobs WHERE id=?", (job_id,)).fetchone()
+            spec_cache = {0: json.loads(base_row["spec"])} if base_row else {}
+            out = []
+            for r in rows:
+                if r["base_revision"] not in spec_cache:
+                    if r["base_revision"] == 0:
+                        spec_cache[0] = json.loads(base_row["spec"])
+                    else:
+                        br = conn.execute(
+                            "SELECT spec FROM spec_revisions"
+                            " WHERE job_id=? AND revision=? AND status='confirmed'",
+                            (job_id, r["base_revision"])).fetchone()
+                        spec_cache[r["base_revision"]] = \
+                            json.loads(br["spec"]) if br else {}
+                out.append({"revision": r["revision"],
+                            "base_revision": r["base_revision"],
+                            "confirmed_at": r["confirmed_at"],
+                            "spec": json.loads(r["spec"]),
+                            "base_spec": spec_cache[r["base_revision"]]})
+        return out
+
     def analyze_job(job_id):
         job = load_job(job_id)
         rolls = load_rolls(job_id)
         events = load_events(job_id)
         state, violations = core.analyze(
-            job, rolls, events, genealogy=evaluate_materials(job_id))
+            job, rolls, events, genealogy=evaluate_materials(job_id),
+            defects_context={
+                "confirmed_revisions": _confirmed_revision_context(job_id),
+                "locked_ply_ids": _locked_ply_ids(job_id)})
         return job, rolls, events, state, violations
 
     # ------------------------------------------------------------ 处理器
@@ -260,6 +293,12 @@ def make_app(db_path):
                         raise ApiError(400, {
                             "error": "invalid_environment_event",
                             "message": msg, "type": item["type"]})
+                if item["type"] in _def.DEFECT_EVENT_TYPES:
+                    msg = _def.validate_event_item(item)
+                    if msg:
+                        raise ApiError(400, {
+                            "error": "invalid_defect_event",
+                            "message": msg, "type": item["type"]})
                 seq += 1
                 payload = {k: v for k, v in item.items()
                            if k not in ("type", "operator")}
@@ -314,6 +353,23 @@ def make_app(db_path):
                     "surface_intervals": len(
                         state["environment"].get("surface_intervals") or []),
                     "decisions": state["environment"].get("decisions") or [],
+                },
+                "repairs": {
+                    "enabled": state["repairs"].get("enabled", False),
+                    "instruction_version":
+                        state["repairs"].get("instruction_version"),
+                    "defect_count": len(
+                        state["repairs"].get("defects") or []),
+                    "open_count": sum(
+                        1 for d in state["repairs"].get("defects") or []
+                        if d.get("status") != "signed"),
+                    "defects": [{"defect_id": d["defect_id"],
+                                 "type": d["type"],
+                                 "source_ply": d["source_ply"],
+                                 "zone": d["zone"],
+                                 "status": d["status"],
+                                 "generation": d["current_generation"]}
+                                for d in state["repairs"].get("defects") or []],
                 },
             },
         }
@@ -720,9 +776,38 @@ def make_app(db_path):
                         "violation_count": len(violations)})
         return 200, {"unit_id": uid, "affected_jobs": out}
 
+    # ------------------------------------------------------------ 局部缺陷处置
+    def h_list_defects(ctx, job_id):
+        _job, _rolls, _events, state, _violations = analyze_job(job_id)
+        rep = state.get("repairs") or {}
+        return 200, {
+            "job_id": job_id,
+            "instruction_version": rep.get("instruction_version"),
+            "openings": rep.get("openings") or [],
+            "defects": [{"defect_id": d["defect_id"], "type": d["type"],
+                         "source_ply": d["source_ply"], "zone": d["zone"],
+                         "status": d["status"],
+                         "generation": d["current_generation"],
+                         "instruction": d["instruction"],
+                         "disposition": d["disposition"],
+                         "found_event": d["found_event"]}
+                        for d in rep.get("defects") or []]}
+
+    def h_get_defect(ctx, job_id, defect_id):
+        _job, _rolls, _events, state, violations = analyze_job(job_id)
+        d = next((x for x in (state.get("repairs") or {}).get("defects") or []
+                  if x["defect_id"] == defect_id), None)
+        if d is None:
+            raise ApiError(404, {"error": "defect_not_found",
+                                 "job_id": job_id, "defect_id": defect_id})
+        return 200, {
+            **d,
+            "violations": [x for x in violations
+                           if defect_id in (x.get("details") or {})
+                           .get("defects", [])]}
+
     # ------------------------------------------------------------ 路由表
-    routes = [
-        ("POST", r"^/jobs$", h_create_job),
+    routes = [        ("POST", r"^/jobs$", h_create_job),
         ("GET", r"^/jobs$", h_list_jobs),
         ("GET", r"^/jobs/([^/]+)$", h_get_job),
         ("POST", r"^/jobs/([^/]+)/rolls$", h_add_roll),
@@ -739,6 +824,8 @@ def make_app(db_path):
         ("GET", r"^/jobs/([^/]+)/spec-revisions/(\d+)$", h_get_revision),
         ("POST", r"^/jobs/([^/]+)/spec-revisions/(\d+)/confirm$",
          h_confirm_revision),
+        ("GET", r"^/jobs/([^/]+)/defects$", h_list_defects),
+        ("GET", r"^/jobs/([^/]+)/defects/([^/]+)$", h_get_defect),
         ("POST", r"^/materials/units$", h_create_material_unit),
         ("GET", r"^/materials/units$", h_list_material_units),
         ("GET", r"^/materials/units/([^/]+)$", h_get_material_unit),

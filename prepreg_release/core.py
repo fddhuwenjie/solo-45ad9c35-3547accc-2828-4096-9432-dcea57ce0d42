@@ -24,6 +24,11 @@ EVENT_TYPES = {
     # 开袋回温 / 环境暴露现场事件（见 environment.py）
     "package_opened", "material_temp_reading", "environment_reading",
     "layup_paused", "surface_covered", "layup_resumed",
+    # 局部缺陷处置：发现/隔离/局部揭除/补片/复检/轮廓变更/工程师签发
+    # （见 defects.py）
+    "defect_found", "defect_isolated", "defect_ply_removed",
+    "patch_placed", "defect_reinspected", "defect_contour_updated",
+    "repair_signed",
 }
 
 DEFAULT_RULES = {
@@ -166,11 +171,13 @@ def out_time_hours(ledger, t):
 
 # ---------------------------------------------------------------- 主分析
 
-def analyze(job, rolls, events, genealogy=None):
+def analyze(job, rolls, events, genealogy=None, defects_context=None):
     """重建状态并执行全部放行规则。返回 (state, violations)。
 
     genealogy 为材料谱系评估结果（genealogy.evaluate 的返回，可空）：
     其违规并入放行判定，其状态进入 state["materials"] 供快照/随件包使用。
+    defects_context 为局部缺陷处置评估上下文（可空）：
+      {"confirmed_revisions": [...], "locked_cutoff": int|None}
     """
     spec = job["spec"] or {}
     rules = dict(DEFAULT_RULES)
@@ -238,6 +245,16 @@ def analyze(job, rolls, events, genealogy=None):
         job, spec, zones, spec_by_id, materials, stack, events,
         ledger, genealogy, rolls)
     V.extend(env_violations)
+
+    # ---- 局部缺陷处置（缺陷/补片/开孔统一投影模具坐标，逐层核查）----
+    from . import defects as _defects
+    dctx = defects_context or {}
+    defects_state, defects_violations = _defects.evaluate_defects(
+        job, spec, zones, spec_plies, materials, stack, events, rolls,
+        genealogy=genealogy,
+        confirmed_revisions=dctx.get("confirmed_revisions") or (),
+        locked_ply_ids=dctx.get("locked_ply_ids") or ())
+    V.extend(defects_violations)
 
     # ---- 材料谱系（裁切/拆包/退库/报废，外置继承与数量核平）----
     if genealogy:
@@ -468,14 +485,15 @@ def analyze(job, rolls, events, genealogy=None):
 
     state = _build_state(job, zones, materials, spec_plies, spec_by_id,
                          rolls, stack, active, ledger, events, thickness_of,
-                         comp_state, genealogy, env_state)
+                         comp_state, genealogy, env_state, defects_state)
     V.sort(key=lambda x: (x["rule"], x["plies"]))
     return state, V
 
 
 def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
                  stack, active, ledger, events, thickness_of,
-                 comp_state=None, genealogy=None, env_state=None):
+                 comp_state=None, genealogy=None, env_state=None,
+                 defects_state=None):
     """按层序重建的分区覆盖与厚度，以及料卷外置时间台账。"""
     plies_out = []
     for pos, e in enumerate(active, 1):
@@ -561,6 +579,10 @@ def _build_state(job, zones, materials, spec_plies, spec_by_id, rolls,
             "material_temp_series": [], "material_intervals": [],
             "surface_intervals": [], "cover_windows": [],
             "bag_windows": [], "decisions": []},
+        # 局部缺陷处置：指令版本、开孔、缺陷案例（代际/揭除/补片/复检/签发）
+        "repairs": defects_state
+        or {"enabled": False, "instruction_version": None,
+            "openings": [], "defects": []},
     }
 
 
@@ -615,6 +637,10 @@ def build_snapshot(job, rolls, events, state):
             "material_temp_series": [], "material_intervals": [],
             "surface_intervals": [], "cover_windows": [],
             "bag_windows": [], "decisions": []},
+        # 局部缺陷处置随件包：所用指令版本、缺陷/补片几何、事件链与人工签发
+        "repairs": state.get("repairs")
+        or {"enabled": False, "instruction_version": None,
+            "openings": [], "defects": []},
     }
 
 
@@ -764,8 +790,42 @@ def diff_snapshots(sa, sb):
         "decisions_changed": _dec_sig(ea) != _dec_sig(eb),
         "decisions_added": sorted(set(_dec_sig(eb)) - set(_dec_sig(ea))),
     }
+    # 局部缺陷处置：缺陷案例增删、代际/状态/签发的版本差异
+    def _rep_sig(d):
+        return (d.get("status"), d.get("current_generation"),
+                d.get("instruction"),
+                json.dumps(d.get("contour"), sort_keys=True),
+                len(d.get("generations") or []),
+                json.dumps(
+                    (d.get("generations") or [{}])[-1].get("sign")
+                    if d.get("generations") else None,
+                    sort_keys=True, ensure_ascii=False))
+
+    ra = {d["defect_id"]: d for d in (sa.get("repairs") or {}).get("defects") or []}
+    rb = {d["defect_id"]: d for d in (sb.get("repairs") or {}).get("defects") or []}
+    defects_changed = []
+    for did in sorted(set(ra) & set(rb)):
+        if _rep_sig(ra[did]) != _rep_sig(rb[did]):
+            defects_changed.append({
+                "defect_id": did,
+                "status": {"from": ra[did].get("status"),
+                           "to": rb[did].get("status")},
+                "generation": {"from": ra[did].get("current_generation"),
+                               "to": rb[did].get("current_generation")},
+                "instruction": {"from": ra[did].get("instruction"),
+                                "to": rb[did].get("instruction")},
+            })
+    repairs_diff = {
+        "instruction_version": {"a": (sa.get("repairs") or {}).get("instruction_version"),
+                                "b": (sb.get("repairs") or {}).get("instruction_version")},
+        "defects_added": sorted(set(rb) - set(ra)),
+        "defects_closed": sorted(
+            did for did in set(ra) & set(rb)
+            if ra[did].get("status") != "signed"
+            and rb[did].get("status") == "signed"),
+        "defects_changed": defects_changed,
+    }
     return {
-        "spec_changed": sa["spec_hash"] != sb["spec_hash"],
         "spec_hash": {"a": sa["spec_hash"], "b": sb["spec_hash"]},
         "batches": {
             "added": sorted(set(bb) - set(ba)),
@@ -785,4 +845,5 @@ def diff_snapshots(sa, sb):
         },
         "materials": materials_diff,
         "environment": environment_diff,
+        "repairs": repairs_diff,
     }
