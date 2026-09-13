@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS material_events (
     operator    TEXT,
     recorded_at TEXT NOT NULL
 );
+
+-- 规范换版：propose 时写入（spec/映射/返工序列自此固定），confirm 仅翻转
+-- status/confirmed_at；铺放与材料事件链不受影响（保持只读）
+CREATE TABLE IF NOT EXISTS spec_revisions (
+    job_id         TEXT NOT NULL REFERENCES jobs(id),
+    revision       INTEGER NOT NULL,
+    base_revision  INTEGER NOT NULL,        -- 派生自（0 = 建档规范）
+    spec           TEXT NOT NULL,           -- JSON：新规范全文
+    reason         TEXT NOT NULL,           -- 变更理由
+    effective_at   TEXT NOT NULL,           -- 生效时刻
+    impact         TEXT NOT NULL,           -- JSON：层映射/沿用层/返工序列
+    status         TEXT NOT NULL DEFAULT 'proposed',  -- proposed | confirmed
+    created_at     TEXT NOT NULL,
+    confirmed_at   TEXT,
+    PRIMARY KEY (job_id, revision)
+);
 """
 
 

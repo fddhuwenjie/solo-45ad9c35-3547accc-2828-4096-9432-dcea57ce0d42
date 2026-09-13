@@ -14,6 +14,14 @@
   GET  /jobs/{id}/approvals/{v}/package   JSON 随件包（取自冻结快照）
   GET  /jobs/{id}/approvals/diff?a=&b=    版本比较（取自冻结快照）
 
+规范换版（铺层中途换版：材料替代/丢层调整/开孔边界变化）：
+  POST /jobs/{id}/spec-revisions          提议换版：派生自指定版本，返回影响
+                                          分析（沿用层/返工序列）；冲突 409 不启用
+  GET  /jobs/{id}/spec-revisions          换版列表
+  GET  /jobs/{id}/spec-revisions/{r}      换版详情（含层映射与返工序列）
+  POST /jobs/{id}/spec-revisions/{r}/confirm  确认启用：后续校验/批准/随件包
+                                          从该分支重算，事件链保持只读
+
 材料谱系（全局共享、跨工单，事件链只允许追加）：
   POST /materials/units                   登记整卷（制造/失效日期、计量单位、初始数量）
   GET  /materials/units                   单元列表（含数量核平与外置寿命）
@@ -31,6 +39,7 @@ from urllib.parse import parse_qs
 from . import core
 from . import genealogy as _gen
 from . import compaction as _comp
+from . import revision as _rev
 from .store import Store
 
 
@@ -77,15 +86,24 @@ def make_app(db_path):
     def load_job(job_id):
         with store.db() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if row is None:
-            raise ApiError(404, {"error": "job_not_found", "job_id": job_id})
-        return {
+            if row is None:
+                raise ApiError(404, {"error": "job_not_found", "job_id": job_id})
+            rev = conn.execute(
+                "SELECT revision,spec FROM spec_revisions"
+                " WHERE job_id=? AND status='confirmed'"
+                " ORDER BY revision DESC LIMIT 1", (job_id,)).fetchone()
+        job = {
             "id": row["id"], "name": row["name"], "status": row["status"],
             "tool_datum": json.loads(row["tool_datum"]),
             "zones": json.loads(row["zones"]),
             "spec": json.loads(row["spec"]),
             "created_at": row["created_at"],
+            # 生效规范版本：0 = 建档规范；>0 = 已确认换版
+            "spec_revision": rev["revision"] if rev else 0,
         }
+        if rev:  # 校验/批准/随件包一律从已确认的换版分支重算
+            job["spec"] = json.loads(rev["spec"])
+        return job
 
     def load_rolls(job_id):
         with store.db() as conn:
@@ -346,6 +364,162 @@ def make_app(db_path):
         return 200, {"job_id": job_id, "from": a, "to": b,
                      "diff": core.diff_snapshots(sa, sb)}
 
+    # ------------------------------------------------------------ 规范换版
+    def _revision_spec(job_id, rev_no):
+        """指定版本规范全文：0 = 建档规范；>0 = 已确认换版（proposed 不作基线）。"""
+        with store.db() as conn:
+            if rev_no == 0:
+                row = conn.execute("SELECT spec FROM jobs WHERE id=?",
+                                   (job_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT spec FROM spec_revisions"
+                    " WHERE job_id=? AND revision=? AND status='confirmed'",
+                    (job_id, rev_no)).fetchone()
+        return json.loads(row["spec"]) if row else None
+
+    def _locked_ply_ids(job_id):
+        """最近批准快照冻结的实铺层号（换版返工不得揭除）。"""
+        with store.db() as conn:
+            row = conn.execute(
+                "SELECT snapshot FROM approvals WHERE job_id=?"
+                " ORDER BY version DESC LIMIT 1", (job_id,)).fetchone()
+        if row is None:
+            return set()
+        snap = json.loads(row["snapshot"])
+        return {p["ply_id"]
+                for p in (snap.get("state") or {}).get("plies") or []}
+
+    def h_propose_revision(ctx, job_id):
+        job = load_job(job_id)
+        b = ctx["body"]
+        new_spec = b.get("spec")
+        if not isinstance(new_spec, dict) \
+                or not isinstance(new_spec.get("plies"), list) \
+                or not new_spec["plies"]:
+            raise ApiError(400, {"error": "invalid_spec",
+                                 "message": "spec.plies 必须是非空列表"})
+        for sp in new_spec["plies"]:
+            if not isinstance(sp, dict) or not sp.get("ply_id") \
+                    or not isinstance(sp.get("seq"), int) \
+                    or isinstance(sp.get("seq"), bool):
+                raise ApiError(400, {
+                    "error": "invalid_spec",
+                    "message": "每个规范层需要 ply_id 与整数 seq"})
+        reason = b.get("reason")
+        if not reason or not isinstance(reason, str):
+            raise ApiError(400, {"error": "missing_fields", "fields": ["reason"]})
+        effective_at = core.parse_time(b.get("effective_at")) \
+            if b.get("effective_at") else None
+        if effective_at is None:
+            raise ApiError(400, {"error": "invalid_effective_at",
+                                 "message": "effective_at 缺失或无法解析"})
+        base = b.get("base_revision", job["spec_revision"])
+        if not isinstance(base, int) or isinstance(base, bool) or base < 0:
+            raise ApiError(400, {"error": "invalid_base_revision",
+                                 "message": "base_revision 必须是非负整数"})
+        base_spec = _revision_spec(job_id, base)
+        if base_spec is None:
+            raise ApiError(404, {"error": "base_revision_not_found",
+                                 "base_revision": base})
+        explicit = b.get("mapping")
+        if explicit is not None:
+            if not isinstance(explicit, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str)
+                    for k, v in explicit.items()):
+                raise ApiError(400, {
+                    "error": "invalid_mapping",
+                    "message": "mapping 必须是 {新层号: 旧层号} 的字典"})
+            new_ids = {sp["ply_id"] for sp in new_spec["plies"]}
+            old_ids = {sp.get("ply_id")
+                       for sp in (base_spec or {}).get("plies") or []}
+            for k, v in explicit.items():
+                if k not in new_ids:
+                    raise ApiError(400, {"error": "invalid_mapping",
+                                         "message": f"映射目标 {k} 不在新规范中"})
+                if v not in old_ids:
+                    raise ApiError(400, {"error": "invalid_mapping",
+                                         "message": f"映射来源 {v} 不在基线规范中"})
+        impact, conflicts = _rev.analyze(
+            job, load_events(job_id), base_spec, new_spec, effective_at,
+            locked_plies=_locked_ply_ids(job_id), explicit_mapping=explicit,
+            new_zones=b.get("zones"), new_tool_datum=b.get("tool_datum"))
+        if conflicts:
+            raise ApiError(409, {
+                "error": "spec_revision_conflict",
+                "message": "规范换版存在冲突，未启用新版",
+                "conflicts": conflicts, "impact": impact})
+        now = core.utcnow()
+        with store.db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(revision),0) AS m FROM spec_revisions"
+                " WHERE job_id=?", (job_id,)).fetchone()
+            rev_no = row["m"] + 1
+            conn.execute(  # 规范/映射/处置决定写入即固定，confirm 不再改
+                "INSERT INTO spec_revisions(job_id,revision,base_revision,spec,"
+                "reason,effective_at,impact,status,created_at)"
+                " VALUES(?,?,?,?,?,?,?,'proposed',?)",
+                (job_id, rev_no, base, json.dumps(new_spec, ensure_ascii=False),
+                 reason, b["effective_at"],
+                 json.dumps(impact, ensure_ascii=False), now))
+        return 201, {"job_id": job_id, "revision": rev_no,
+                     "base_revision": base, "status": "proposed",
+                     "spec_hash": _rev.spec_hash(new_spec), "impact": impact}
+
+    def h_list_revisions(ctx, job_id):
+        load_job(job_id)
+        with store.db() as conn:
+            rows = conn.execute(
+                "SELECT revision,base_revision,reason,effective_at,status,"
+                "created_at,confirmed_at FROM spec_revisions WHERE job_id=?"
+                " ORDER BY revision", (job_id,)).fetchall()
+        return 200, {"revisions": [dict(r) for r in rows]}
+
+    def _load_revision(job_id, rev_no):
+        with store.db() as conn:
+            row = conn.execute(
+                "SELECT * FROM spec_revisions WHERE job_id=? AND revision=?",
+                (job_id, rev_no)).fetchone()
+        if row is None:
+            raise ApiError(404, {"error": "revision_not_found",
+                                 "job_id": job_id, "revision": rev_no})
+        return row
+
+    def h_get_revision(ctx, job_id, rev):
+        load_job(job_id)
+        row = _load_revision(job_id, int(rev))
+        out = dict(row)
+        out["spec"] = json.loads(out["spec"])
+        out["impact"] = json.loads(out["impact"])
+        return 200, out
+
+    def h_confirm_revision(ctx, job_id, rev):
+        job = load_job(job_id)
+        rev_no = int(rev)
+        row = _load_revision(job_id, rev_no)
+        if row["status"] == "confirmed":
+            raise ApiError(409, {"error": "already_confirmed",
+                                 "revision": rev_no})
+        if row["base_revision"] != job["spec_revision"]:
+            raise ApiError(409, {
+                "error": "stale_base",
+                "message": f"该换版派生自规范 v{row['base_revision']}，但当前"
+                           f"生效为 v{job['spec_revision']}，需重新提议",
+                "base_revision": row["base_revision"],
+                "current_revision": job["spec_revision"]})
+        with store.db() as conn:
+            conn.execute(
+                "UPDATE spec_revisions SET status='confirmed', confirmed_at=?"
+                " WHERE job_id=? AND revision=?",
+                (core.utcnow(), job_id, rev_no))
+            if job["status"] == "approved":
+                # 规范分支已切换，原批准失效，需按新规范重新放行
+                conn.execute("UPDATE jobs SET status='open' WHERE id=?",
+                             (job_id,))
+        return 200, {"job_id": job_id, "revision": rev_no,
+                     "status": "confirmed",
+                     "spec_hash": _rev.spec_hash(json.loads(row["spec"]))}
+
     # ------------------------------------------------------------ 材料谱系
     def _insert_material_event(conn, item, now):
         """材料事件只 INSERT；返回全局 seq。"""
@@ -523,6 +697,11 @@ def make_app(db_path):
         ("GET", r"^/jobs/([^/]+)/approvals$", h_list_approvals),
         ("GET", r"^/jobs/([^/]+)/approvals/diff$", h_diff),
         ("GET", r"^/jobs/([^/]+)/approvals/(\d+)/package$", h_package),
+        ("POST", r"^/jobs/([^/]+)/spec-revisions$", h_propose_revision),
+        ("GET", r"^/jobs/([^/]+)/spec-revisions$", h_list_revisions),
+        ("GET", r"^/jobs/([^/]+)/spec-revisions/(\d+)$", h_get_revision),
+        ("POST", r"^/jobs/([^/]+)/spec-revisions/(\d+)/confirm$",
+         h_confirm_revision),
         ("POST", r"^/materials/units$", h_create_material_unit),
         ("GET", r"^/materials/units$", h_list_material_units),
         ("GET", r"^/materials/units/([^/]+)$", h_get_material_unit),

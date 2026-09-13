@@ -193,3 +193,50 @@ status, r = call("GET", f"/jobs/{jid}/approvals/2/package")
 show("JSON 随件包（v2 快照）", status, r,
      keys=["package", "version", "spec_hash", "chain_hash", "material_batches",
            "state", "compaction"])
+
+# ---------------------------------------------------------------- 6. 规范换版
+# 铺层中途工艺换版：已批准锁定的实铺层不得揭除 → 冲突，不启用新版
+rev_spec = json.loads(json.dumps(spec))              # 深拷贝现行规范
+rev_spec["materials"]["CF-EP-3K-B"] = {"ply_thickness": 0.125}
+rev_spec["plies"][4]["material"] = "CF-EP-3K-B"      # P05 材料替代
+status, r = call("POST", f"/jobs/{jid}/spec-revisions", {
+    "spec": rev_spec, "reason": "材料替代：CF-EP-3K 停产",
+    "effective_at": "2026-09-12T08:00:00Z"})
+show("换版提议：返工需揭除已锁层 → 冲突不启用", status, r,
+     keys=["error", "conflicts"])
+
+# 改为新增一层（不动已锁层）→ 提议 → 确认 → 补铺 → 再批准
+rev_spec = json.loads(json.dumps(spec))
+rev_spec["plies"].append({"seq": 7, "ply_id": "P07", "material": "CF-EP-3K",
+                          "angle": 0, "face": "up", "zones": ["Z1", "Z2"]})
+rev_spec["rules"]["require_symmetry"] = False
+status, r = call("POST", f"/jobs/{jid}/spec-revisions", {
+    "spec": rev_spec, "reason": "开孔边界变化：端部补一层 0° 增强",
+    "effective_at": "2026-09-12T08:00:00Z"})
+show("换版提议：新增 P07（全部实铺层沿用）", status, r,
+     keys=["revision", "base_revision", "status", "impact"])
+rev = r["revision"]
+
+status, r = call("POST", f"/jobs/{jid}/spec-revisions/{rev}/confirm")
+show("确认换版：新规范/映射/处置决定固定，工单回到待放行", status, r)
+
+status, r = call("GET", f"/jobs/{jid}/validate")
+show("换版分支校验：新增层待补铺", status, r,
+     keys=["release", "violation_count", "violations"])
+
+status, r = call("POST", f"/jobs/{jid}/events",
+                 {"type": "ply_placed", "operator": "op-zhang", "ply_id": "P07",
+                  "roll": "R1", "angle": 0, "face": "up", "geometry": FULL,
+                  "placed_at": "2026-09-12T09:00:00Z"})
+show("按返工序列补铺 P07（事件链只增不改）", status, r)
+
+status, r = call("GET", f"/jobs/{jid}/validate")
+show("复检通过", status, r, keys=["release", "violation_count"])
+
+status, r = call("POST", f"/jobs/{jid}/approve", {"approved_by": "qe-wang"})
+show("换版分支批准 v3", status, r)
+
+status, r = call("GET", f"/jobs/{jid}/approvals/diff", query="a=2&b=3")
+show("版本比较 v2→v3：规范已变更、层数 6→7", status, r,
+     keys=["from", "to", "diff"])
+
